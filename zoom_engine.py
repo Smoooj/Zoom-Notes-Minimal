@@ -54,7 +54,6 @@ from zoom_notes import (
     find_wal,
     parse_transcript,
     parse_meeting_title,
-    read_calendar_title,
     format_transcript,
     build_transcript_content,
     save_transcript_only,
@@ -1648,20 +1647,9 @@ class ZoomEngine:
     def _derive_meeting_title(self, blocks_wal, transcript_wal, entries) -> str:
         anchor_entries = [e for e in entries if e.get("meeting_id")] or entries
 
-        # Apple Calendar is the most authoritative source — it has the actual
-        # invite name. Try it first. Falls back to None if the sidecar is
-        # absent, stale, or no event window overlaps the transcript.
+        # Use Zoom's cached title when available, otherwise a dated fallback.
         meeting_title = None
-        try:
-            meeting_title = read_calendar_title(anchor_entries)
-        except Exception:
-            pass
-
-        # WAL title as fallback — Zoom's own title detection. Can produce
-        # speaker names or "Google Calendar Meeting (not synced)" for meetings
-        # where Zoom couldn't read the calendar, but is better than nothing
-        # when no calendar event matched.
-        if not meeting_title and blocks_wal:
+        if blocks_wal:
             try:
                 meeting_title = parse_meeting_title(blocks_wal, anchor_entries)
             except Exception:

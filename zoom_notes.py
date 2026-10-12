@@ -1250,62 +1250,6 @@ def _title_has_hash_token(text: str) -> bool:
     return any(_HASH_TOKEN_RE.fullmatch(f) for f in fragments if f)
 
 
-_CALENDAR_EVENTS_PATH = Path.home() / ".local" / "share" / "zoom-notes" / "calendar_events.json"
-
-
-def read_calendar_title(transcript_entries: list[dict]) -> str | None:
-    """Return the Apple Calendar event title whose window covers this transcript.
-
-    Reads the sidecar written by CalendarService.swift every 5 minutes.
-    The sidecar contains today's multi-attendee events with HH:MM start/end
-    times. Finds the event whose start <= earliest_transcript_time <= end.
-    When multiple events overlap, prefers the one closest to starting.
-    Returns None if the file is absent or no event matches.
-    """
-    try:
-        p = _CALENDAR_EVENTS_PATH
-        # Reject a sidecar written on a previous day — its HH:MM times carry
-        # no date, so a stale file would match today's meetings by time overlap
-        # and return a wrong title from a prior day.
-        mtime = datetime.fromtimestamp(p.stat().st_mtime).date()
-        if mtime < datetime.now().date():
-            return None
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-    ts_strings = sorted(e.get("timestamp") for e in transcript_entries if e.get("timestamp"))
-    if not ts_strings:
-        return None
-
-    # Earliest transcript entry as HH:MM for comparison against sidecar HH:MM times
-    ref_hhmm = ts_strings[0][:5]  # "HH:MM"
-
-    best_title: str | None = None
-    best_delta: int | None = None  # in minutes, smaller = closer to start of event
-
-    for event in raw:
-        title = event.get("title", "").strip()
-        start = event.get("startDate", "")
-        end = event.get("endDate", "")
-        if not title or len(start) != 5 or len(end) != 5:
-            continue
-        if not (start <= ref_hhmm <= end):
-            continue
-        # delta in minutes from event start to first transcript entry
-        try:
-            sh, sm = int(start[:2]), int(start[3:])
-            rh, rm = int(ref_hhmm[:2]), int(ref_hhmm[3:])
-            delta = (rh * 60 + rm) - (sh * 60 + sm)
-        except ValueError:
-            continue
-        if best_delta is None or delta < best_delta:
-            best_delta = delta
-            best_title = title
-
-    return best_title
-
-
 def parse_meeting_title(blocks_wal: Path, transcript_entries: list[dict] | None = None) -> str | None:
     """Extract the meeting title from the blocks WAL.
 
@@ -1770,9 +1714,7 @@ def cmd_save(origin: Path, dry_run: bool = False) -> None:
     entries = parse_transcript(transcript_wal, meeting_id_filter=meeting_id)
     if not entries:
         raise SystemExit("No transcript entries found.")
-    title = read_calendar_title(entries)
-    if not title and blocks_wal:
-        title = parse_meeting_title(blocks_wal, entries)
+    title = parse_meeting_title(blocks_wal, entries) if blocks_wal else None
     mtime = datetime.fromtimestamp(transcript_wal.stat().st_mtime)
     title = title or f"Zoom Meeting {mtime.strftime('%Y-%m-%d %H:%M')}"
     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title)

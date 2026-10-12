@@ -11,13 +11,15 @@ This fork captures Zoom My Notes transcripts and saves them locally. It has no m
 - `zoom_engine.py`: polls every configured interval, accumulates speech, detects idle/boundary changes, saves transcripts, and exposes recovery commands.
 - `ZoomNotesApp/ZoomNotesApp/`: Swift/SwiftUI menu bar application. `EngineManager` starts the Python child and drains stdout and stderr. `AppState` translates engine events into menu state and notifications.
 
+The menu bar status item is icon-only in every engine state. There is no calendar access or upcoming-meeting system.
+
 Runtime dependencies are Python's standard library, the macOS `strings` command, and Apple frameworks. Pytest is test-only. The app bundles Python 3.12 via `scripts/fetch-python-runtime.sh`.
 
 ## Capture and saving
 
 Resolve every signed-in or unsigned WebKit bucket rather than assuming a fixed origin. Database prefixes are hints; content discovery is authoritative. Keep incremental, atomic recovery snapshots so a Zoom checkpoint or engine restart cannot lose already captured speech.
 
-Save only a meeting's own entries (plus early entries with no meeting ID). Meeting titles come from optional Apple Calendar metadata, Zoom's title cache, or a dated fallback. Do not synthesize titles from speech.
+Save only a meeting's own entries (plus early entries with no meeting ID). Meeting titles come from Zoom's title cache or a dated fallback. Do not synthesize titles from speech.
 
 Different meetings with the same title must not overwrite each other. `meeting_id` frontmatter is the identity check used by the collision-safe writer. A successful save removes the recovery snapshot; a failed write keeps it recoverable.
 

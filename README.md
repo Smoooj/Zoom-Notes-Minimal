@@ -16,7 +16,7 @@ By default, each meeting produces one file:
 
 Files contain meeting metadata, speaker names, timestamps, and the captured speech. There are no separate summary files or links to nonexistent notes. Custom YAML frontmatter applies to transcripts.
 
-Meeting titles come from Apple Calendar when enabled, then Zoom's cached meeting title, and finally a dated fallback. Files for different meetings with the same title get separate filenames rather than overwriting each other.
+Meeting titles come from Zoom's cached meeting title or a dated fallback. Files for different meetings with the same title get separate filenames rather than overwriting each other.
 
 ## Requirements
 
@@ -40,9 +40,9 @@ xcodebuild -project ZoomNotesApp/ZoomNotesApp.xcodeproj \
 
 The build contains the Swift app, the Python engine, and a bundled Python runtime. For a signed local installation, review `scripts/install-local.sh` and run `make install`.
 
-Once running, open **Settings → Output** to choose a transcript folder and filename pattern. **Advanced** controls the polling interval, idle threshold, database hints, and blocked meetings. The optional **Calendar** integration supplies meeting titles and the existing upcoming-meeting menu.
+Once running, open **Settings → Output** to choose a transcript folder and filename pattern. **Advanced** controls the polling interval, idle threshold, database hints, and blocked meetings.
 
-The menu bar offers **Save Transcript Now**, shows the last saved transcript, and provides recovery or retry options after a crash or failed file write.
+The menu bar item displays only an icon. Its menu offers **Save Transcript Now**, shows the last saved transcript, and provides recovery or retry options after a crash or failed file write.
 
 Existing transcript output preferences are preserved when loading older settings files. Removed model, prompt, and summary-output fields are ignored. Previously stored credentials are not read or modified.
 
@@ -63,7 +63,7 @@ Optional overrides are documented in `.env.example`: `ZOOM_NOTES_TRANSCRIPTS_DIR
 - `zoom_notes.py`: cache discovery, transcript parsing, deduplication, local persistence, and Markdown writing.
 - `zoom_config.py`: local output and capture preferences.
 - `zoom_engine.py`: background capture, idle detection, meeting isolation, saving, and recovery.
-- `ZoomNotesApp/`: Swift/SwiftUI menu bar app, settings, calendar integration, and notifications.
+- `ZoomNotesApp/`: Swift/SwiftUI menu bar app, settings and notifications.
 
 Capture snapshots survive engine restarts. Failed saves remain recoverable in the existing cache retention flow. Recovery saves the raw transcript and can run while another meeting is being captured.
 

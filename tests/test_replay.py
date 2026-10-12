@@ -114,7 +114,7 @@ def test_cli_save_and_dry_run_use_the_same_transcript_writer(tmp_path, monkeypat
     monkeypatch.setattr(zoom_notes, "find_wal", lambda *args, **kwargs: wal)
     monkeypatch.setattr(zoom_notes, "detect_active_meeting_id", lambda *args: "A")
     monkeypatch.setattr(zoom_notes, "parse_transcript", lambda *args, **kwargs: [entry])
-    monkeypatch.setattr(zoom_notes, "read_calendar_title", lambda *args: "Test Meeting")
+    monkeypatch.setattr(zoom_notes, "parse_meeting_title", lambda *args: "Test Meeting")
     zoom_notes.cmd_save(tmp_path, dry_run=True)
     assert "Keep this verbatim." in capsys.readouterr().out
     assert not cfg.transcripts_path.exists()

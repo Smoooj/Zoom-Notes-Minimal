@@ -80,4 +80,3 @@ def isolated_runtime_files(tmp_path, monkeypatch):
     monkeypatch.setattr(zoom_config, "_CONFIG_FILE", tmp_path / "settings" / "settings.json")
     monkeypatch.setattr(zoom_config, "_cached_config", None)
     monkeypatch.setattr(zoom_notes, "_CACHE_DIR", tmp_path / "cache")
-    monkeypatch.setattr(zoom_notes, "_CALENDAR_EVENTS_PATH", tmp_path / "calendar.json")
