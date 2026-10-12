@@ -9,7 +9,7 @@ The incident:
                  - ``detect_active_meeting_id`` had locked onto the wrong
                    id at 11:32 (A's data was still resident in the WAL),
                  - the strict accumulator filter returned 0 entries,
-                 - the (Apr-28-installed) ``_collect_entries_for_generation``
+                 - the (Apr-28-installed) ``_collect_entries_for_save``
                    fallback handed every accumulator entry — including a
                    stale Anna fragment from the prior day — to the LLM,
                  - ``parse_meeting_title``'s 2-hour window matched the
@@ -62,32 +62,13 @@ def synthetic_wal(tmp_path):
 
 @pytest.fixture
 def isolated_vault(tmp_path, monkeypatch):
-    """Redirect ``cfg.notes_path`` and ``cfg.transcripts_path`` so save
-    functions land in the test tmpdir instead of the real vault.
-
-    The config exposes ``notes_path``/``transcripts_path`` as read-only
-    properties that derive from ``notes_dir``/``transcripts_dir`` strings,
-    so we set the underlying string fields. Patches both
-    ``zoom_notes.get_config`` (used by save functions when no cfg passed)
-    and the ``ZoomEngine._get_cfg`` reader so engine code sees the same
-    redirected paths.
-    """
-    notes_dir = tmp_path / "vault" / "Notes"
     transcripts_dir = tmp_path / "vault" / "Transcripts"
-    notes_dir.mkdir(parents=True)
     transcripts_dir.mkdir(parents=True)
-
-    real_get_config = zoom_notes.get_config
-
-    def fake_get_config():
-        cfg = real_get_config()
-        cfg.notes_dir = str(notes_dir)
-        cfg.transcripts_dir = str(transcripts_dir)
-        return cfg
-
-    monkeypatch.setattr(zoom_notes, "get_config", fake_get_config)
-    monkeypatch.setattr(zoom_engine, "get_config", fake_get_config)
-    yield {"notes": notes_dir, "transcripts": transcripts_dir}
+    from zoom_config import ZoomNotesConfig
+    cfg = ZoomNotesConfig(transcripts_dir=str(transcripts_dir), transcript_filename_pattern="{title}")
+    monkeypatch.setattr(zoom_notes, "get_config", lambda: cfg)
+    monkeypatch.setattr(zoom_engine, "get_config", lambda: cfg)
+    yield {"notes": transcripts_dir, "transcripts": transcripts_dir}
 
 
 def _make_entry(msg_id: str, text: str, *, meeting_id: str, speaker: str = "Test User",
@@ -156,12 +137,8 @@ class TestSaveDoesNotOverwriteDifferentMeeting:
     ):
         cfg = zoom_notes.get_config()
         # Save meeting A first.
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "summary A", "Daily Standup", "2026-04-30",
-                ["Alex", "Nick"], "2026-04-30T11:21:00", cfg,
-                meeting_id="meeting_A",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("summary A", "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_A"),
             "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_A",
         )
         # Backdate A's mtime past the legacy 60s overwrite window so the
@@ -174,12 +151,8 @@ class TestSaveDoesNotOverwriteDifferentMeeting:
         first_text = first.read_text()
 
         # Save meeting B with the same derived title.
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "summary B", "Daily Standup", "2026-04-30",
-                ["Marc", "Nick"], "2026-04-30T12:05:00", cfg,
-                meeting_id="meeting_B",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("summary B", "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_B"),
             "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_B",
         )
 
@@ -205,12 +178,8 @@ class TestSaveDoesNotOverwriteDifferentMeeting:
         retry.
         """
         cfg = zoom_notes.get_config()
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "first attempt", "Daily Standup", "2026-04-30",
-                ["Alex"], "2026-04-30T11:21:00", cfg,
-                meeting_id="meeting_X",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("first attempt", "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_X"),
             "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_X",
         )
         notes_dir = isolated_vault["notes"] / "2026-04-30"
@@ -220,12 +189,8 @@ class TestSaveDoesNotOverwriteDifferentMeeting:
 
         # Refresh the same meeting (e.g. retry after LLM failure replaced
         # the placeholder).
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "second attempt", "Daily Standup", "2026-04-30",
-                ["Alex"], "2026-04-30T11:21:00", cfg,
-                meeting_id="meeting_X",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("second attempt", "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_X"),
             "Daily Standup", "2026-04-30", cfg, meeting_id="meeting_X",
         )
 
@@ -256,12 +221,8 @@ class TestSaveDoesNotOverwriteDifferentMeeting:
         old_mtime = legacy.stat().st_mtime - 3600
         os.utime(legacy, (old_mtime, old_mtime))
 
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "engine summary", "Daily Standup", "2026-04-30",
-                ["Alex"], "2026-04-30T11:21:00", cfg,
-                meeting_id="some_id",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("engine summary", "Daily Standup", "2026-04-30", cfg, meeting_id="some_id"),
             "Daily Standup", "2026-04-30", cfg, meeting_id="some_id",
         )
 
@@ -292,11 +253,7 @@ class TestReadExistingMeetingId:
         # Real Zoom ids contain `+`, `/`, `=` which trigger _yaml_quote
         # to emit a JSON-quoted string.
         real_id = "sYlA31NdTImpchTAfmEpuw=="
-        body = zoom_notes.build_note_content(
-            "summary", "Test", "2026-04-30",
-            ["Alex"], "2026-04-30T12:00:00", None,
-            meeting_id=real_id,
-        )
+        body = zoom_notes.build_transcript_content("summary", "Test", "2026-04-30", None, meeting_id=real_id)
         path = tmp_path / "n.md"
         path.write_text(body)
         assert zoom_notes._read_existing_meeting_id(path) == real_id
@@ -510,7 +467,7 @@ class TestDetectExcludesJustCompletedMeeting:
 
 
 class TestCollectEntriesSelfHealing:
-    """When ``_collect_entries_for_generation`` finds zero entries matching
+    """When ``_collect_entries_for_save`` finds zero entries matching
     the active meeting, it now self-heals: pick the meeting_id with the
     most accumulator entries whose timestamps are at or after session
     start, and use those instead. The 2026-04-30 scenario: tracking
@@ -559,7 +516,7 @@ class TestCollectEntriesSelfHealing:
         # recent in-session rather than tripping the future guard when the
         # suite runs early in the day.
         with _freeze_engine_now(11, 34):
-            entries, recovered_id = engine._collect_entries_for_generation(
+            entries, recovered_id = engine._collect_entries_for_save(
                 transcript_wal=None,
                 active_meeting_id="just_ended_standup",  # WRONG id
             )
@@ -583,7 +540,7 @@ class TestCollectEntriesSelfHealing:
                 "x": _make_entry("x", "stale", meeting_id="meetingA",
                                  timestamp="13:07:23"),
             }
-        entries, recovered_id = engine._collect_entries_for_generation(
+        entries, recovered_id = engine._collect_entries_for_save(
             transcript_wal=None, active_meeting_id="meetingB",
         )
         assert entries == []
@@ -611,7 +568,7 @@ class TestCollectEntriesSelfHealing:
         # timestamp reads as a recent in-session entry rather than being
         # rejected by the >now+5min "stale future" guard.
         with _freeze_engine_now(13, 10):
-            entries, recovered_id = engine._collect_entries_for_generation(
+            entries, recovered_id = engine._collect_entries_for_save(
                 transcript_wal=None, active_meeting_id="something_we_thought",
             )
         # Recovery picks the most-common id whose latest_ts is in the session
@@ -643,23 +600,15 @@ class TestBackToBackEndToEnd:
         cfg = engine._get_cfg()
         # `isolated_vault` already redirected get_config; verify the engine
         # picks up the redirected paths (they're under tmp, not real vault).
-        assert str(cfg.notes_path) == str(isolated_vault["notes"])
+        assert str(cfg.transcripts_path) == str(isolated_vault["notes"])
         assert str(cfg.transcripts_path) == str(isolated_vault["transcripts"])
 
         # Stub out the LLM call — our test is about file-save / detection
         # correctness, not summary content.
-        monkeypatch.setattr(
-            zoom_engine, "summarize",
-            lambda text, title, cfg, cancel_event=None: f"### Summary\n{title}",
-        )
         # generate_title uses zoom_notes.get_api_key (bound at import time, not
         # affected by the zoom_config patch below). Mock it at the zoom_engine
         # level so tests with a live Keychain entry don't make real HTTP calls.
-        monkeypatch.setattr(zoom_engine, "generate_title", lambda *a, **kw: None)
         # Skip API key check so the engine doesn't refuse to generate.
-        monkeypatch.setattr(
-            "zoom_config.get_api_key", lambda provider: "fake-key",
-        )
 
         # Use today's wall-clock time as the WAL mtime so the resulting
         # "Zoom Meeting <YYYY-MM-DD HH:MM>" fallback title (and the dated
@@ -676,7 +625,7 @@ class TestBackToBackEndToEnd:
                     detected_meeting_id="standup_meeting_id_AA")
         # Tick 2: WAL grows; IDLE -> ACTIVE under standup.
         # 5 entries needed to clear the _abandoned_looks_real threshold
-        # that _generate_notes now enforces.
+        # that _save_transcript now enforces.
         standup_entries = [
             _make_entry("a1", "team status", meeting_id="standup_meeting_id_AA",
                         speaker="Alex", timestamp="11:05:00"),
@@ -854,12 +803,8 @@ class TestSaveProtectionWhenMeetingIdEmpty:
     ):
         cfg = zoom_notes.get_config()
         # Save 1: engine-generated with empty meeting_id (the failure mode).
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "first meeting summary", "Same Title", "2026-04-30",
-                ["Alex"], "2026-04-30T13:34:00", cfg,
-                meeting_id="",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("first meeting summary", "Same Title", "2026-04-30", cfg, meeting_id=""),
             "Same Title", "2026-04-30", cfg, meeting_id="",
         )
         notes_dir = isolated_vault["notes"] / "2026-04-30"
@@ -873,12 +818,8 @@ class TestSaveProtectionWhenMeetingIdEmpty:
 
         # Save 2: a completely different meeting that ALSO got an empty
         # meeting_id (same Zoom-late-write bug). Slugifies to the same name.
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "SECOND DIFFERENT MEETING", "Same Title", "2026-04-30",
-                ["Marc"], "2026-04-30T15:23:00", cfg,
-                meeting_id="",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("SECOND DIFFERENT MEETING", "Same Title", "2026-04-30", cfg, meeting_id=""),
             "Same Title", "2026-04-30", cfg, meeting_id="",
         )
 
@@ -902,12 +843,8 @@ class TestSaveProtectionWhenMeetingIdEmpty:
         last attempt rather than piling up siblings. This tests that
         carve-out is still in effect."""
         cfg = zoom_notes.get_config()
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "first attempt", "Manual Rerun", "2026-04-30",
-                ["Alex"], "2026-04-30T12:00:00", cfg,
-                meeting_id="",  # build emits meeting_id: "" but...
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("first attempt", "Manual Rerun", "2026-04-30", cfg, meeting_id=""),
             "Manual Rerun", "2026-04-30", cfg,
             meeting_id=None,  # ...the SAVE was called without one (CLI)
         )
@@ -915,12 +852,8 @@ class TestSaveProtectionWhenMeetingIdEmpty:
         first = notes_dir / "Manual Rerun.md"
         assert first.exists()
         # Don't backdate — within the 60s window.
-        zoom_notes.save_note_only(
-            zoom_notes.build_note_content(
-                "second attempt", "Manual Rerun", "2026-04-30",
-                ["Alex"], "2026-04-30T12:00:01", cfg,
-                meeting_id="",
-            ),
+        zoom_notes.save_transcript_only(
+            zoom_notes.build_transcript_content("second attempt", "Manual Rerun", "2026-04-30", cfg, meeting_id=""),
             "Manual Rerun", "2026-04-30", cfg, meeting_id=None,
         )
         assert "second attempt" in first.read_text()
@@ -1104,7 +1037,7 @@ class TestCollectEntriesSelfHealWhenEmpty:
         # empty string), not the right id. Pin "now" to 14:35 — just after the
         # Brand Team entries — so they aren't rejected by the future guard.
         with _freeze_engine_now(14, 35):
-            entries, recovered_id = engine._collect_entries_for_generation(
+            entries, recovered_id = engine._collect_entries_for_save(
                 transcript_wal=None, active_meeting_id="",
             )
         assert recovered_id == "brand_team_id_AA", (
@@ -1135,7 +1068,7 @@ class TestCollectEntriesSelfHealWhenEmpty:
                                       meeting_id="some_id",
                                       timestamp="13:07:23"),
             }
-        entries, recovered_id = engine._collect_entries_for_generation(
+        entries, recovered_id = engine._collect_entries_for_save(
             transcript_wal=None, active_meeting_id="",
         )
         assert entries == []

@@ -8,7 +8,7 @@
 //  States map to menu bar icon:
 //    idle       → doc.plaintext (grey, template)
 //    active     → doc.plaintext (blue accent)
-//    generating → gear (spinning-ish — static icon with tint)
+//    saving → gear (spinning-ish — static icon with tint)
 //
 
 import Cocoa
@@ -85,7 +85,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         )
 
         let retryAction = UNNotificationAction(
-            identifier: "RETRY_NOTE_GEN",
+            identifier: "RETRY_TRANSCRIPT_SAVE",
             title: "Retry",
             options: [.foreground]
         )
@@ -94,7 +94,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             title: "Show transcript"
         )
         let failedCategory = UNNotificationCategory(
-            identifier: "NOTE_FAILED",
+            identifier: "TRANSCRIPT_FAILED",
             actions: [retryAction, showTranscriptAction],
             intentIdentifiers: []
         )
@@ -182,13 +182,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         let userInfo = response.notification.request.content.userInfo
         switch response.actionIdentifier {
         case "OPEN_IN_FINDER", UNNotificationDefaultActionIdentifier:
-            if let path = userInfo["notePath"] as? String, !path.isEmpty {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-            } else if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
+            if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
             }
-        case "RETRY_NOTE_GEN":
-            ConsoleLogger.shared.logUserAction("Retry note generation (from notification)")
+        case "RETRY_TRANSCRIPT_SAVE":
+            ConsoleLogger.shared.logUserAction("Retry transcript saving (from notification)")
             Task { @MainActor in self.appState.retryFailedMeeting() }
         case "SHOW_TRANSCRIPT":
             if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
@@ -270,7 +268,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 statusTitle = "Idle — waiting for meeting"
             }
         case .active:     statusTitle = "Meeting in progress…"
-        case .generating: statusTitle = "Generating notes…"
+        case .saving: statusTitle = "Saving transcript…"
         case .unknown:    statusTitle = "Engine starting…"
         }
         let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
@@ -327,7 +325,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         if let title = appState.lastSavedTitle, !title.isEmpty {
             let lastItem = NSMenuItem(
                 title: "Last saved: \(title)",
-                action: #selector(openLastNoteInFinder),
+                action: #selector(openLastTranscriptInFinder),
                 keyEquivalent: ""
             )
             lastItem.target = self
@@ -336,7 +334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         }
 
         // Recoverable meetings — in-progress accumulators left on disk by a
-        // prior crashed engine session OR by a previous LLM failure that's
+        // prior crashed engine session OR by a previous save failure that's
         // still inside its 30-day failed/ retention window. Single recovery
         // shows inline; two or more collapse into a submenu.
         if !appState.recoverableMeetings.isEmpty {
@@ -416,11 +414,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
-        // Retry note generation if a failed meeting is queued. The transcript
-        // is already on disk; this just re-runs the LLM call.
+        // Retry a local file write from the retained capture snapshot.
         if let failure = appState.lastFailedMeeting {
             let retryItem = NSMenuItem(
-                title: "Retry note generation: \(failure.title)",
+                title: "Retry transcript saving: \(failure.title)",
                 action: #selector(retryFailed),
                 keyEquivalent: "r"
             )
@@ -451,8 +448,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         // Manual trigger when active
         if state == .active {
             let genItem = NSMenuItem(
-                title: "Generate Notes Now",
-                action: #selector(generateNow),
+                title: "Save Transcript Now",
+                action: #selector(saveNow),
                 keyEquivalent: "g"
             )
             genItem.keyEquivalentModifierMask = .command
@@ -471,11 +468,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
-        // Error display — show errors that are actionable; suppress transient/auth noise
-        if let err = appState.engineError,
-           !err.contains("401"),
-           !err.contains("API key"),
-           !err.contains("quota exceeded") {
+        if let err = appState.engineError {
             let errItem = NSMenuItem(title: "⚠ \(err)", action: nil, keyEquivalent: "")
             errItem.isEnabled = false
             menu.addItem(errItem)
@@ -518,11 +511,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 button.imagePosition = .imageOnly
                 button.contentTintColor = .controlAccentColor
                 button.toolTip = "Zoom Notes — Meeting in progress"
-            case .generating:
+            case .saving:
                 button.title = ""
                 button.imagePosition = .imageOnly
                 button.contentTintColor = .systemOrange
-                button.toolTip = "Zoom Notes — Generating notes…"
+                button.toolTip = "Zoom Notes — Saving transcript…"
             }
         }
     }
@@ -530,14 +523,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
     // MARK: - Menu actions
 
-    @objc func generateNow() {
-        ConsoleLogger.shared.logUserAction("Generate Notes Now")
-        appState.engineManager.sendCommand(["cmd": "generate"])
-    }
-
-    @objc func openLastNoteInFinder() {
-        guard let path = appState.lastSavedPath, !path.isEmpty else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    @objc func saveNow() {
+        ConsoleLogger.shared.logUserAction("Save Transcript Now")
+        appState.engineManager.sendCommand(["cmd": "save"])
     }
 
     @objc func openLastTranscriptInFinder() {
@@ -548,7 +536,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     }
 
     @objc func retryFailed() {
-        ConsoleLogger.shared.logUserAction("Retry note generation")
+        ConsoleLogger.shared.logUserAction("Retry transcript saving")
         appState.retryFailedMeeting()
     }
 
@@ -599,7 +587,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
     /// Optional subtitle line shown beneath the recover item when there's
     /// only one recoverable meeting. For failed bucket entries we surface
-    /// the LLM error so the user knows what to fix before retrying.
+    /// the save error so the user knows what to fix before retrying.
     private func recoverableSubtitleDetail(for rec: RecoverableMeeting) -> String {
         switch rec.location {
         case .failed:
@@ -730,42 +718,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         onboardingWindow?.close()
         onboardingWindow = nil
         NSApp.setActivationPolicy(.accessory)
-    }
-
-    // MARK: - Privacy disclaimer
-
-    private static let privacyDisclaimerKey = "hasSeenPrivacyDisclaimer.v1"
-
-    private func showPrivacyDisclaimerIfNeeded() {
-        let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: Self.privacyDisclaimerKey) else { return }
-
-        let alert = NSAlert()
-        alert.messageText = "Heads up: transcripts are sent to your LLM provider"
-        alert.informativeText = """
-        Zoom Notes generates meeting summaries by sending the full transcript \
-        of each meeting to whichever LLM provider you configure (Claude, OpenAI, \
-        or Gemini by default). Anything spoken in the meeting — including \
-        sensitive or confidential content — is included.
-
-        If you need local-only processing, choose Ollama in Settings → API / LLM. \
-        Ollama runs entirely on your Mac and never sends data to a third party.
-        """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Got it")
-        alert.addButton(withTitle: "Open Settings")
-
-        // Make sure the alert is visible by briefly going active.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        NSApp.setActivationPolicy(.accessory)
-
-        defaults.set(true, forKey: Self.privacyDisclaimerKey)
-
-        if response == .alertSecondButtonReturn {
-            showSettings()
-        }
     }
 
     // MARK: - NSWindowDelegate

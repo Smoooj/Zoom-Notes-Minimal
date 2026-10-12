@@ -316,7 +316,7 @@ class TestRecurringMeetingDedupe:
 
         # Simulate a successful prior generation for this meeting_id at an
         # earlier session_start_mtime.
-        engine._last_generated_session = (recurring_id, 500.0)
+        engine._last_saved_session = (recurring_id, 500.0)
 
         # New IDLE→ACTIVE at a fresh mtime — same meeting_id, but a
         # different fingerprint.
@@ -336,7 +336,7 @@ class TestRecurringMeetingDedupe:
         # don't, so the engine is free to generate again on the next
         # idle-timeout — exactly what the user expects for a recurring
         # meeting on a new day.
-        assert (current_meeting_id, active_session_mtime) != engine._last_generated_session
+        assert (current_meeting_id, active_session_mtime) != engine._last_saved_session
 
     def test_post_success_same_session_is_suppressed(
         self, fake_origin, fixture_wal_path, isolated_cache, multi_meeting_meta
@@ -357,7 +357,7 @@ class TestRecurringMeetingDedupe:
         # Override tracked meeting_id so we can match on a known one
         # regardless of which the WAL scoring picked.
         engine._write_tracking(meeting_id=recurring_id)
-        engine._last_generated_session = (recurring_id, active_session_mtime)
+        engine._last_saved_session = (recurring_id, active_session_mtime)
 
         # Same fingerprint → would-be duplicate generation should NOT fire.
         # We verify by calling the dedupe check path directly: post-success,
@@ -367,7 +367,7 @@ class TestRecurringMeetingDedupe:
         # (which involves WAL re-scoring that's tested separately).
         _, _, _, mid = engine._read_tracking()
         msm = engine._read_session_mtime()
-        assert (mid, msm) == engine._last_generated_session, \
+        assert (mid, msm) == engine._last_saved_session, \
             "checkpoint mutation must keep the same fingerprint as the one we generated for"
 
 

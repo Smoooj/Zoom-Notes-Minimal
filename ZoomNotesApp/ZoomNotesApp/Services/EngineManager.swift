@@ -72,27 +72,14 @@ class EngineManager: ObservableObject {
         try? stdin.fileHandleForWriting.write(contentsOf: data)
     }
 
-    /// Reload settings: SIGHUP for config-only changes, full restart when API keys may have changed.
-    /// A full restart is required after key changes because the API keys are
-    /// injected into the engine's environment at spawn time — SIGHUP only
-    /// invalidates the Python config cache, not the env vars.
-    func reloadSettings(restartForNewKeys: Bool = true) {
+    /// Reload capture and output preferences without restarting the engine.
+    func reloadSettings() {
         guard let proc = process, proc.isRunning else {
-            // Engine isn't running at all — start it instead of failing silently.
-            log("[EngineManager] reloadSettings() called but engine isn't running — spawning", level: .info)
             spawnEngine()
             return
         }
-        if restartForNewKeys {
-            log("[EngineManager] Restarting engine to pick up new API keys", level: .info)
-            intentionalRestart = true
-            proc.terminate()
-            // The waitUntilExit() watcher in spawnEngine() will see
-            // intentionalRestart==true and re-spawn after the process dies.
-        } else {
-            kill(proc.processIdentifier, SIGHUP)
-            log("[EngineManager] Sent SIGHUP to engine (PID \(proc.processIdentifier))", level: .info)
-        }
+        kill(proc.processIdentifier, SIGHUP)
+        log("[EngineManager] Reloaded transcript settings", level: .info)
     }
 
     // MARK: - Private
@@ -137,19 +124,6 @@ class EngineManager: ObservableObject {
         // Ensure the script's directory is on sys.path so zoom_config / zoom_notes imports resolve
         let scriptDir = URL(fileURLWithPath: scriptPath).deletingLastPathComponent().path
         env["PYTHONPATH"] = scriptDir + ":" + (env["PYTHONPATH"] ?? "")
-
-        // Inject API keys from Keychain so Python never needs to call `security`
-        // (avoids repeated keychain permission prompts for the python/security binaries)
-        let keyMap: [(account: String, envVar: String)] = [
-            ("anthropic_api_key", "ANTHROPIC_API_KEY"),
-            ("openai_api_key",    "OPENAI_API_KEY"),
-            ("gemini_api_key",    "GEMINI_API_KEY"),
-        ]
-        for pair in keyMap {
-            if let key = keychainGet(account: pair.account), !key.isEmpty {
-                env[pair.envVar] = key
-            }
-        }
 
         proc.environment = env
 

@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""
-Zoom Notes
-Reads Zoom's live AI Notetaker WAL files to extract transcripts,
-then summarizes them via your configured LLM and saves to your output directory.
+"""Zoom Notes — capture Zoom My Notes transcripts and save them locally.
 
 Usage:
-  python zoom_notes.py --list          # List recent meetings found in WAL
-  python zoom_notes.py --dump          # Print current transcript to stdout
-  python zoom_notes.py --watch         # Live-follow transcript during a meeting
-  python zoom_notes.py --notes         # Generate and save meeting notes
-  python zoom_notes.py --notes --dry-run  # Preview notes without saving
+  python zoom_notes.py --list
+  python zoom_notes.py --dump
+  python zoom_notes.py --watch
+  python zoom_notes.py --save [--dry-run]
 """
 
 import argparse
@@ -20,10 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-import urllib.request
-import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -31,10 +24,8 @@ from pathlib import Path
 from zoom_config import (
     ZoomNotesConfig,
     get_config,
-    get_api_key,
     resolve_subfolder,
     resolve_filename,
-    DEFAULT_SYSTEM_PROMPT,
 )
 
 
@@ -709,7 +700,7 @@ def load_failed_sidecar(meeting_id: str) -> dict | None:
 
 
 def delete_persisted_accumulator(meeting_id: str) -> None:
-    """Remove the in-progress snapshot after successful note generation.
+    """Remove the in-progress snapshot after successfully saving the transcript.
 
     Clears BOTH the root and the `failed/` location. The retry success path
     is the one common entry point that should clean up regardless of which
@@ -735,8 +726,7 @@ def delete_persisted_accumulator(meeting_id: str) -> None:
 def mark_meeting_failed(meeting_id: str, metadata: dict | None = None) -> None:
     """Promote a snapshot from the root cache into `failed/`.
 
-    Called from the engine's note_failed branch after the placeholder note
-    is written. Moves both the .json and .md files atomically and writes
+    Called from the engine's transcript_failed branch after a local save fails. Moves both the .json and .md files atomically and writes
     a sidecar with the metadata the menu bar needs to label the recovery
     item ("Sales Sync — failed 3 days ago", etc.).
 
@@ -745,7 +735,7 @@ def mark_meeting_failed(meeting_id: str, metadata: dict | None = None) -> None:
     rewritten with fresh metadata + a refreshed `failed_at` timestamp.
 
     `metadata` is a dict written verbatim to the sidecar. Recommended keys:
-      title, attendees, transcript_path, note_path, message, date_str.
+      title, message, date_str.
     `failed_at` is always added/refreshed by this function.
     """
     slug = _safe_meeting_id_slug(meeting_id)
@@ -913,7 +903,7 @@ def list_recoverable_meetings(min_entries: int = 1) -> list[dict]:
     sidecar when present:
       - title          : the human meeting title at the time of failure
       - failed_at      : ISO8601 timestamp the snapshot was promoted to failed/
-      - last_error     : the LLM error message that triggered the failure
+      - last_error     : the save error message that triggered the failure
 
     Files with fewer than `min_entries` entries are skipped — they're either
     empty placeholders from a meeting that ended before any speech, or
@@ -952,7 +942,7 @@ def _demote_snapshot_to_failed(json_path: Path) -> None:
 
     Called by purge_stale_accumulators for root .json files whose mtime is
     from a prior calendar day.  The snapshot must not auto-load into a live
-    session (that causes Case-B abandoned-meeting logic to generate notes for
+    session (that causes Case-B abandoned-meeting logic to save transcripts for
     the wrong meeting), but deleting it silently would destroy unrecovered
     transcripts.  Moving it to failed/ is the right middle ground: the engine
     ignores it for live detection, and the menu bar surfaces it as a
@@ -976,7 +966,7 @@ def _demote_snapshot_to_failed(json_path: Path) -> None:
             except OSError:
                 pass
 
-    # Write a minimal sidecar only if one doesn't already exist (a real LLM
+    # Write a minimal sidecar only if one doesn't already exist (a real save
     # failure sidecar written earlier takes precedence).
     sidecar_path = failed_dir / f"{slug}.{_FAILED_SIDECAR_NAME}"
     if not sidecar_path.exists():
@@ -985,7 +975,7 @@ def _demote_snapshot_to_failed(json_path: Path) -> None:
                 sidecar_path,
                 json.dumps({
                     "demoted_at": datetime.now().isoformat(timespec="seconds"),
-                    "message": "Notes were not generated (auto-archived from a prior day).",
+                    "message": "Transcript was not saved (auto-archived from a prior day).",
                 }, ensure_ascii=False),
             )
         except OSError:
@@ -1062,7 +1052,7 @@ def _sanitize_speaker(name: str) -> str:
     """Strip control chars and clip to 80 chars.
 
     Speaker names are user-controlled (Zoom self-rename / external attendees)
-    and end up both in the rendered Markdown transcript AND in the LLM prompt
+    and end up both in the rendered Markdown transcript AND in the saved transcript
     context, so they're a small prompt-injection vector. Stripping ASCII
     control codes and clipping to a reasonable length keeps things clean
     without blocking legitimate emoji or non-Latin scripts.
@@ -1444,435 +1434,11 @@ def format_transcript(entries: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
-# ── LLM Summarization ──────────────────────────────────────────────────────────
-
-def summarize_with_claude(
-    transcript: str,
-    meeting_title: str,
-    api_key: str,
-    model: str = "claude-sonnet-4-6",
-    api_url: str = "https://api.anthropic.com/v1/messages",
-    system_prompt: str | None = None,
-    cancel_event: threading.Event | None = None,
-) -> str:
-    """Call Claude (Anthropic) API to summarize the transcript."""
-    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-    payload = {
-        "model": model,
-        "max_tokens": 64000,
-        "system": prompt,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    f"Meeting: {meeting_title}\n\n"
-                    f"Transcript:\n\n{transcript}"
-                ),
-            }
-        ],
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        api_url,
-        data=data,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
-    return _http_retry(req, lambda body: body["content"][0]["text"], cancel_event=cancel_event)
-
-
-def summarize_with_openai(
-    transcript: str,
-    meeting_title: str,
-    api_key: str,
-    model: str = "gpt-4o",
-    api_url: str = "https://api.openai.com/v1/chat/completions",
-    system_prompt: str | None = None,
-    cancel_event: threading.Event | None = None,
-) -> str:
-    """Call OpenAI Chat Completions API to summarize the transcript."""
-    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"Meeting: {meeting_title}\n\n"
-                    f"Transcript:\n\n{transcript}"
-                ),
-            },
-        ],
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        api_url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
-    return _http_retry(
-        req,
-        lambda body: body["choices"][0]["message"]["content"],
-        cancel_event=cancel_event,
-    )
-
-
-def summarize_with_gemini(
-    transcript: str,
-    meeting_title: str,
-    api_key: str,
-    model: str = "gemini-2.0-flash",
-    base_url: str = "https://generativelanguage.googleapis.com/v1beta/models",
-    system_prompt: str | None = None,
-    cancel_event: threading.Event | None = None,
-) -> str:
-    """Call Google Gemini generateContent API to summarize the transcript."""
-    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-    url = f"{base_url}/{model}:generateContent?key={api_key}"
-    payload = {
-        "system_instruction": {"parts": [{"text": prompt}]},
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            f"Meeting: {meeting_title}\n\n"
-                            f"Transcript:\n\n{transcript}"
-                        )
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {"maxOutputTokens": 8192},
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    return _http_retry(
-        req,
-        lambda body: body["candidates"][0]["content"]["parts"][0]["text"],
-        cancel_event=cancel_event,
-    )
-
-
-def summarize_with_ollama(
-    transcript: str,
-    meeting_title: str,
-    model: str = "llama3.2",
-    base_url: str = "http://localhost:11434",
-    system_prompt: str | None = None,
-    cancel_event: threading.Event | None = None,
-) -> str:
-    """Call Ollama /api/chat to summarize the transcript (no API key needed)."""
-    prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-    url = f"{base_url.rstrip('/')}/api/chat"
-    payload = {
-        "model": model,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"Meeting: {meeting_title}\n\n"
-                    f"Transcript:\n\n{transcript}"
-                ),
-            },
-        ],
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    return _http_retry(req, lambda body: body["message"]["content"], cancel_event=cancel_event)
-
-
 class CancelledError(RuntimeError):
-    """Raised when a cancel_event fires mid-generation. Distinct type so callers
-    can disambiguate cancellation from genuine LLM errors when surfacing
-    messages to the user (cancellation is silent — a placeholder note for
-    cancelled work is just noise)."""
+    """Raised when transcript saving is cancelled before writing a file."""
 
 
-def _cancel_sleep(seconds: float, cancel_event: threading.Event | None) -> None:
-    """Sleep for `seconds` total, but abort early when `cancel_event` fires.
-
-    Plain `time.sleep` blocks until the timer expires; the backoff path used
-    to sleep up to 60s, which dominated cancellation latency. Splitting into
-    1s chunks via `Event.wait` cuts the worst-case to ~1s while keeping the
-    same overall pacing on the happy path.
-    """
-    if cancel_event is None:
-        time.sleep(seconds)
-        return
-    deadline = time.monotonic() + seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        if cancel_event.wait(min(1.0, remaining)):
-            raise CancelledError("LLM call cancelled")
-
-
-# Per-attempt urllib timeout. 90s is comfortably above the longest legitimate
-# LLM call we observe in the wild while keeping cancellation latency bounded
-# (cancel_event set during an in-flight HTTP request can only be observed
-# when urlopen returns or times out — so this number IS the cancel ceiling).
-_HTTP_TIMEOUT_SECS = 90
-
-
-def _http_retry(
-    req: urllib.request.Request,
-    extract_fn,
-    retries: int = 4,
-    cancel_event: threading.Event | None = None,
-) -> str:
-    """Shared retry loop for all LLM HTTP calls.
-
-    `cancel_event`, when set, aborts the loop at the next checkpoint:
-      - between attempts (before sleep)
-      - during the inter-attempt backoff sleep
-      - just before the next urlopen
-    Already in-flight HTTP requests still run to their `_HTTP_TIMEOUT_SECS`
-    ceiling because urllib doesn't expose a cooperative interrupt.
-    """
-    _RETRYABLE = {429, 500, 502, 503, 504}
-    last_exc: Exception | None = None
-    for attempt in range(retries):
-        if cancel_event is not None and cancel_event.is_set():
-            raise CancelledError("LLM call cancelled")
-        if attempt:
-            _cancel_sleep(15 * (2 ** (attempt - 1)), cancel_event)  # 15s, 30s, 60s
-        if cancel_event is not None and cancel_event.is_set():
-            raise CancelledError("LLM call cancelled")
-        try:
-            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECS) as resp:
-                body = json.loads(resp.read())
-            try:
-                return extract_fn(body)
-            except (KeyError, IndexError, TypeError) as e:
-                raise RuntimeError(f"Unexpected LLM response shape: {e}") from e
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            last_exc = RuntimeError(f"LLM API error {e.code}: {error_body}")
-            if e.code not in _RETRYABLE:
-                raise last_exc from e
-        except OSError as e:
-            last_exc = RuntimeError(f"LLM network error: {e}")
-    raise last_exc or RuntimeError("LLM call failed after retries")
-
-
-def summarize(
-    transcript: str,
-    meeting_title: str,
-    cfg: ZoomNotesConfig | None = None,
-    cancel_event: threading.Event | None = None,
-) -> str:
-    """
-    Dispatch to the correct LLM backend based on cfg.llm_provider.
-    cfg defaults to get_config() if not provided.
-
-    `cancel_event`, when set, aborts retries / backoff sleeps with
-    `CancelledError`. Already in-flight HTTP calls run to the per-attempt
-    `_HTTP_TIMEOUT_SECS` ceiling (urllib has no cooperative interrupt).
-    """
-    if cfg is None:
-        cfg = get_config()
-
-    provider = cfg.llm_provider
-    model = cfg.llm_model
-    system_prompt = cfg.effective_system_prompt
-
-    if provider == "claude":
-        api_key = get_api_key("claude")
-        if not api_key:
-            raise RuntimeError(
-                "No Anthropic API key found. Set it in Settings or ANTHROPIC_API_KEY env var."
-            )
-        api_url = os.environ.get("ZOOM_NOTES_API_URL", "https://api.anthropic.com/v1/messages")
-        return summarize_with_claude(
-            transcript, meeting_title, api_key, model, api_url, system_prompt,
-            cancel_event=cancel_event,
-        )
-
-    if provider == "openai":
-        api_key = get_api_key("openai")
-        if not api_key:
-            raise RuntimeError(
-                "No OpenAI API key found. Set it in Settings or OPENAI_API_KEY env var."
-            )
-        return summarize_with_openai(
-            transcript, meeting_title, api_key, model, cfg.openai_base_url, system_prompt,
-            cancel_event=cancel_event,
-        )
-
-    if provider == "gemini":
-        api_key = get_api_key("gemini")
-        if not api_key:
-            raise RuntimeError(
-                "No Gemini API key found. Set it in Settings or GEMINI_API_KEY env var."
-            )
-        return summarize_with_gemini(
-            transcript, meeting_title, api_key, model, cfg.gemini_base_url, system_prompt,
-            cancel_event=cancel_event,
-        )
-
-    if provider == "ollama":
-        return summarize_with_ollama(
-            transcript, meeting_title, model, cfg.ollama_base_url, system_prompt,
-            cancel_event=cancel_event,
-        )
-
-    raise RuntimeError(f"Unknown LLM provider: {provider!r}")
-
-
-_GENERATE_TITLE_PROMPT = (
-    "Give this meeting a short, descriptive title (5 words or fewer). "
-    "Reply with ONLY the title — no punctuation at the end, no quotes, no explanation."
-)
-
-_TITLE_CLEANUP_RE = re.compile(r"^(?:title|meeting|topic)[\s:–\-]+", re.IGNORECASE)
-
-
-def generate_title(transcript: str, cfg: "ZoomNotesConfig | None" = None) -> str | None:
-    """Ask the LLM for a short meeting title derived from the transcript.
-
-    Called when neither Apple Calendar nor the blocks WAL could supply a
-    title (i.e. the engine would otherwise fall back to "Zoom Meeting …").
-    Returns None on any error so callers degrade gracefully.
-    """
-    if cfg is None:
-        cfg = get_config()
-
-    excerpt = transcript[:3000].strip()
-    if not excerpt:
-        return None
-
-    provider = cfg.llm_provider
-    model = cfg.llm_model
-
-    try:
-        if provider == "claude":
-            api_key = get_api_key("claude")
-            if not api_key:
-                return None
-            api_url = os.environ.get("ZOOM_NOTES_API_URL", "https://api.anthropic.com/v1/messages")
-            payload = {
-                "model": model,
-                "max_tokens": 50,
-                "system": _GENERATE_TITLE_PROMPT,
-                "messages": [{"role": "user", "content": excerpt}],
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                api_url, data=data,
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                method="POST",
-            )
-            raw = _http_retry(req, lambda b: b["content"][0]["text"], retries=1)
-
-        elif provider == "openai":
-            api_key = get_api_key("openai")
-            if not api_key:
-                return None
-            payload = {
-                "model": model,
-                "max_tokens": 50,
-                "messages": [
-                    {"role": "system", "content": _GENERATE_TITLE_PROMPT},
-                    {"role": "user", "content": excerpt},
-                ],
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                cfg.openai_base_url, data=data,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "content-type": "application/json",
-                },
-                method="POST",
-            )
-            raw = _http_retry(req, lambda b: b["choices"][0]["message"]["content"], retries=1)
-
-        elif provider == "gemini":
-            api_key = get_api_key("gemini")
-            if not api_key:
-                return None
-            url = f"{cfg.gemini_base_url}/{model}:generateContent?key={api_key}"
-            payload = {
-                "system_instruction": {"parts": [{"text": _GENERATE_TITLE_PROMPT}]},
-                "contents": [{"parts": [{"text": excerpt}]}],
-                "generationConfig": {"maxOutputTokens": 50},
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url, data=data,
-                headers={"content-type": "application/json"},
-                method="POST",
-            )
-            raw = _http_retry(
-                req,
-                lambda b: b["candidates"][0]["content"]["parts"][0]["text"],
-                retries=1,
-            )
-
-        elif provider == "ollama":
-            url = f"{cfg.ollama_base_url.rstrip('/')}/api/chat"
-            payload = {
-                "model": model,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": _GENERATE_TITLE_PROMPT},
-                    {"role": "user", "content": excerpt},
-                ],
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url, data=data,
-                headers={"content-type": "application/json"},
-                method="POST",
-            )
-            raw = _http_retry(req, lambda b: b["message"]["content"], retries=1)
-
-        else:
-            return None
-
-    except Exception:
-        return None
-
-    title = raw.strip().strip('"').strip("'").rstrip(".,;:!?")
-    title = _TITLE_CLEANUP_RE.sub("", title).strip()
-    # Reject multi-line responses (model went rogue) or empty results.
-    if not title or "\n" in title or len(title) > 120:
-        return None
-    return title
-
-
-# ── Note Writing ───────────────────────────────────────────────────────────────
+# ── Transcript writing ─────────────────────────────────────────────────────────
 
 def slugify_title(title: str, fallback_date: str | None = None) -> str:
     """Turn a meeting title into a safe filename fragment.
@@ -1950,14 +1516,14 @@ def _resolve_save_path(target: Path, meeting_id: str | None) -> Path:
       1. Target doesn't exist → use it.
       2. Target exists AND BOTH the new and existing meeting_ids are
          non-empty AND equal → use it (same meeting refreshing itself,
-         e.g. retry-after-LLM-failure).
+         e.g. retry-after-save-failure).
       3. Target exists AND new meeting_id is non-empty AND existing file's
          meeting_id is non-empty but different → search siblings.
       4. Target exists AND either side has an empty/missing meeting_id →
          we cannot prove same-meeting; ALWAYS create a sibling.
 
          The only carve-out for the 60-second legacy window is callers
-         passing `meeting_id=None` (CLI `--notes`, manual recovery). For
+         passing `meeting_id=None` (CLI `--save`, manual recovery). For
          engine-driven saves with empty `meeting_id` (=""), we treat the
          empty values as "unprovable" and create a sibling — that closes
          the 2026-04-30 PM regression where two engine-generated files
@@ -1983,7 +1549,7 @@ def _resolve_save_path(target: Path, meeting_id: str | None) -> Path:
     if meeting_id is None and existing_is_empty:
         # CLI / recovery path AND existing file also has no meeting_id
         # frontmatter (e.g. a prior CLI run): preserve the 60-second
-        # window so a quick rerun (`python zoom_notes.py --notes` twice
+        # window so a quick rerun (`python zoom_notes.py --save` twice
         # while iterating on a prompt) replaces rather than piles up
         # siblings. After 60s, we assume the user moved on and create
         # a sibling instead of silently overwriting older work.
@@ -2026,14 +1592,13 @@ def save_transcript_only(
 ) -> Path:
     """Save just the transcript to the user's Transcripts/ folder.
 
-    This is the durability boundary: once this returns, the meeting's
-    content is safe on disk regardless of whether note generation succeeds.
+    Once this returns, the transcript is safely saved on disk.
 
     `meeting_id` is used to make path resolution collision-safe: a second
     meeting that happens to slugify to the same filename on the same day
     (different Zoom meeting, same derived title) will land in a `-2`
     sibling instead of silently overwriting the first. Callers that don't
-    have a meeting_id (CLI `--notes`) pass None and fall back to the
+    have a meeting_id (CLI `--save`) pass None and fall back to the
     legacy 60-second overwrite window.
     """
     if cfg is None:
@@ -2050,81 +1615,12 @@ def save_transcript_only(
     return transcript_path
 
 
-def save_note_only(
-    note_content: str,
-    meeting_title: str,
-    date_str: str,
-    cfg: ZoomNotesConfig | None = None,
-    *,
-    meeting_id: str | None = None,
-) -> Path:
-    """Save just the note to the user's Notes/ folder.
-
-    Used both for the final LLM-generated note and for the placeholder note
-    written when LLM generation fails.
-
-    See `save_transcript_only` for `meeting_id` semantics — it's the same
-    collision-safety contract.
-    """
-    if cfg is None:
-        cfg = get_config()
-    slug = slugify_title(meeting_title, fallback_date=date_str)
-    subfolder = resolve_subfolder(cfg, date_str)
-    notes_dir = cfg.notes_path / subfolder if subfolder else cfg.notes_path
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    note_filename = resolve_filename(cfg.filename_pattern, slug, date_str) + ".md"
-    note_path = _resolve_save_path(
-        notes_dir / note_filename, meeting_id=meeting_id
-    )
-    _atomic_write_text(note_path, note_content)
-    return note_path
 
 
-def overwrite_note(
-    note_path: Path,
-    note_content: str,
-) -> None:
-    """Overwrite an existing note file in place (used by retry to replace placeholder)."""
-    _atomic_write_text(note_path, note_content)
 
 
-def save_note(
-    note_content: str,
-    transcript_content: str,
-    meeting_title: str,
-    date_str: str,
-    cfg: ZoomNotesConfig | None = None,
-    *,
-    meeting_id: str | None = None,
-) -> Path:
-    """Write note and transcript to their respective dated vault subfolders.
-
-    Convenience wrapper for callers that already have both pieces ready.
-    Engine code should prefer save_transcript_only + save_note_only so a
-    transcript is preserved even when note generation fails.
-    """
-    save_transcript_only(transcript_content, meeting_title, date_str, cfg, meeting_id=meeting_id)
-    return save_note_only(note_content, meeting_title, date_str, cfg, meeting_id=meeting_id)
 
 
-def _path_to_vault_link(actual_path: Path, cfg: "ZoomNotesConfig", kind: str, date_str: str) -> str:
-    """Build an Obsidian wikilink from an actual saved file path.
-
-    Uses the stem of the file (no .md extension) as the link target, so
-    collision-suffixed paths like "Daily Standup — transcript-2.md" produce
-    the correct link "[[Meetings/Transcripts/2026-05-11/Daily Standup — transcript-2]]"
-    rather than the base slug that `resolve_filename` would compute.
-    """
-    subfolder = resolve_subfolder(cfg, date_str)
-    stem = actual_path.stem
-    if kind == "transcript":
-        if subfolder:
-            return f"[[Meetings/Transcripts/{subfolder}/{stem}]]"
-        return f"[[Meetings/Transcripts/{stem}]]"
-    else:
-        if subfolder:
-            return f"[[Meetings/Notes/{subfolder}/{stem}]]"
-        return f"[[Meetings/Notes/{stem}]]"
 
 
 _YAML_UNSAFE_CHARS = set(":#[]{},&*?|>\"'%@`")
@@ -2170,133 +1666,8 @@ def _build_custom_frontmatter(cfg: "ZoomNotesConfig", title: str, date_str: str)
     return ("\n".join(lines) + "\n") if lines else ""
 
 
-def build_note_content(
-    summary: str,
-    meeting_title: str,
-    date_str: str,
-    attendees: list[str],
-    created_iso: str,
-    cfg: ZoomNotesConfig | None = None,
-    *,
-    meeting_id: str | None = None,
-    transcript_link_override: str | None = None,
-) -> str:
-    if cfg is None:
-        cfg = get_config()
-
-    slug = slugify_title(meeting_title, fallback_date=date_str)
-    subfolder = resolve_subfolder(cfg, date_str)
-
-    if transcript_link_override:
-        transcript_link = transcript_link_override
-    else:
-        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
-        transcript_link = (
-            f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
-            if subfolder
-            else f"[[Meetings/Transcripts/{transcript_filename}]]"
-        )
-    daily_link = f"[[Daily/{date_str}]]"
-    attendees_yaml = "\n".join(f"  - {_yaml_quote(a)}" for a in attendees)
-
-    custom_lines = _build_custom_frontmatter(cfg, slug, date_str)
-
-    # `meeting_id` is the canonical identity of this Zoom session and is
-    # what `_resolve_save_path` reads back to decide whether a same-day
-    # filename collision is the same meeting refreshing itself (overwrite
-    # OK) or a different meeting that must not be clobbered (write a -2
-    # sibling). Always emit the field, even when empty, so the absence of
-    # a Zoom-Notes-owned file is unambiguous.
-    meeting_id_line = f"meeting_id: {_yaml_quote(meeting_id or '')}\n"
-
-    return f"""---
-title: {_yaml_quote(slug)}
-type: meeting
-source: zoom-notes
-date: {date_str}
-created: {created_iso}
-{meeting_id_line}attendees:
-{attendees_yaml}
-transcript: {_yaml_quote(transcript_link)}
-daily_note: {_yaml_quote(daily_link)}
-{custom_lines}---
-
-# {slug}
-
-{summary}
-"""
 
 
-def build_placeholder_note(
-    meeting_title: str,
-    date_str: str,
-    attendees: list[str],
-    created_iso: str,
-    error_message: str,
-    meeting_id: str,
-    cfg: ZoomNotesConfig | None = None,
-    *,
-    transcript_link_override: str | None = None,
-) -> str:
-    """Build a placeholder note used when LLM generation fails.
-
-    Includes machine-readable retry metadata in the frontmatter and a
-    human-readable error message in the body so the user can either click
-    Retry in the menu bar or invoke the CLI manually.
-    """
-    if cfg is None:
-        cfg = get_config()
-
-    slug = slugify_title(meeting_title, fallback_date=date_str)
-    subfolder = resolve_subfolder(cfg, date_str)
-
-    if transcript_link_override:
-        transcript_link = transcript_link_override
-    else:
-        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
-        transcript_link = (
-            f"[[Meetings/Transcripts/{date_str}/{transcript_filename}]]"
-            if subfolder
-            else f"[[Meetings/Transcripts/{transcript_filename}]]"
-        )
-    daily_link = f"[[Daily/{date_str}]]"
-    attendees_yaml = "\n".join(f"  - {_yaml_quote(a)}" for a in attendees)
-    cache_slug = _safe_meeting_id_slug(meeting_id)
-    cache_path = f"~/.cache/zoom-notes/in-progress-{cache_slug}.json"
-
-    custom_lines = _build_custom_frontmatter(cfg, slug, date_str)
-
-    body = f"""# {slug}
-
-> **Note generation failed.** The transcript was saved successfully, but the LLM call did not complete.
-
-**Error:** {error_message}
-
-## Retry options
-
-- **Recommended:** Open the Zoom Notes menu bar item and click **Retry note generation**.
-- **Manual CLI:** Run `python zoom_notes.py --notes` (uses the latest WAL) or restore the cached transcript from `{cache_path}` and re-summarize.
-
-The full transcript is preserved at the linked file above and at the cache path so nothing is lost.
-"""
-
-    return f"""---
-title: {_yaml_quote(slug)}
-type: meeting
-source: zoom-notes
-date: {date_str}
-created: {created_iso}
-meeting_id: {_yaml_quote(meeting_id)}
-status: note-generation-failed
-attendees:
-{attendees_yaml}
-transcript: {_yaml_quote(transcript_link)}
-daily_note: {_yaml_quote(daily_link)}
-retry_meeting_id: {_yaml_quote(meeting_id)}
-retry_cache_path: {_yaml_quote(cache_path)}
-{custom_lines}---
-
-{body}"""
 
 
 def build_transcript_content(
@@ -2306,34 +1677,21 @@ def build_transcript_content(
     cfg: ZoomNotesConfig | None = None,
     *,
     meeting_id: str | None = None,
-    note_link_override: str | None = None,
 ) -> str:
     if cfg is None:
         cfg = get_config()
-
     slug = slugify_title(meeting_title, fallback_date=date_str)
-    subfolder = resolve_subfolder(cfg, date_str)
-
-    if note_link_override:
-        note_link = note_link_override
-    else:
-        note_filename = resolve_filename(cfg.filename_pattern, slug, date_str)
-        note_link = (
-            f"[[Meetings/Notes/{date_str}/{note_filename}]]"
-            if subfolder
-            else f"[[Meetings/Notes/{note_filename}]]"
-        )
-    transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
-    meeting_id_line = f"meeting_id: {_yaml_quote(meeting_id or '')}\n"
+    title = resolve_filename(cfg.transcript_filename_pattern, slug, date_str)
+    custom_lines = _build_custom_frontmatter(cfg, slug, date_str)
     return f"""---
-title: {_yaml_quote(transcript_filename)}
+title: {_yaml_quote(title)}
 type: transcript
 source: zoom-notes
 date: {date_str}
-{meeting_id_line}note: {_yaml_quote(note_link)}
----
+meeting_id: {_yaml_quote(meeting_id or '')}
+{custom_lines}---
 
-# {transcript_filename}
+# {title}
 
 {transcript}
 """
@@ -2401,82 +1759,37 @@ def cmd_watch(origin: Path) -> None:
         print("\nStopped.")
 
 
-def cmd_notes(origin: Path, dry_run: bool = False) -> None:
+def cmd_save(origin: Path, dry_run: bool = False) -> None:
+    """Save the current meeting transcript without generating a summary."""
     cfg = get_config()
-
     transcript_wal = find_wal(origin, cfg.transcript_db_prefix, kind="transcript")
     blocks_wal = find_wal(origin, cfg.blocks_db_prefix, kind="blocks")
-
     if not transcript_wal:
-        print("No transcript WAL found.", file=sys.stderr)
-        sys.exit(1)
-
-    active_meeting_id = detect_active_meeting_id(transcript_wal)
-    entries = parse_transcript(transcript_wal, meeting_id_filter=active_meeting_id)
+        raise SystemExit("No transcript WAL found.")
+    meeting_id = detect_active_meeting_id(transcript_wal)
+    entries = parse_transcript(transcript_wal, meeting_id_filter=meeting_id)
     if not entries:
-        print("No transcript entries found.", file=sys.stderr)
-        sys.exit(1)
-
-    # Determine meeting title and date
-    meeting_title = None
-    if blocks_wal:
-        meeting_title = parse_meeting_title(blocks_wal, entries)
-
-    if not meeting_title:
-        mtime = transcript_wal.stat().st_mtime
-        meeting_title = f"Zoom Meeting {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')}"
-
-    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
-    date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
-
-    # Extract unique speakers in order of first appearance (exclude Unknown)
-    seen: dict[str, None] = {}
-    for e in entries:
-        s = e["speaker"]
-        if s and s != "Unknown":
-            seen[s] = None
-    attendees = list(seen.keys())
-
-    created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    transcript_text = format_transcript(entries)
-
-    print(f"Meeting  : {meeting_title}")
-    print(f"Date     : {date_str}")
-    print(f"Speakers : {', '.join(attendees)}")
-    print(f"Lines    : {len(entries)}")
-    print(f"Provider : {cfg.llm_provider} / {cfg.llm_model}")
-
-    print("\nSummarizing...")
-    summary = summarize(transcript_text, meeting_title, cfg)
-
-    note_content = build_note_content(
-        summary, meeting_title, date_str, attendees, created_iso, cfg
-    )
-    transcript_content = build_transcript_content(transcript_text, meeting_title, date_str, cfg)
-
+        raise SystemExit("No transcript entries found.")
+    title = read_calendar_title(entries)
+    if not title and blocks_wal:
+        title = parse_meeting_title(blocks_wal, entries)
+    mtime = datetime.fromtimestamp(transcript_wal.stat().st_mtime)
+    title = title or f"Zoom Meeting {mtime.strftime('%Y-%m-%d %H:%M')}"
+    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title)
+    date_str = date_match.group(1) if date_match else mtime.strftime("%Y-%m-%d")
+    content = build_transcript_content(format_transcript(entries), title, date_str, cfg, meeting_id=meeting_id)
     if dry_run:
-        print("\n" + "─" * 60)
-        print("── NOTE ──")
-        print(note_content)
-        print("\n── TRANSCRIPT ──")
-        print(transcript_content[:800] + "\n... (truncated)")
-        print("─" * 60)
-        print("\n(Dry run — files not saved)")
+        print(content)
     else:
-        note_path = save_note(note_content, transcript_content, meeting_title, date_str, cfg)
-        slug = slugify_title(meeting_title, fallback_date=date_str)
-        subfolder = resolve_subfolder(cfg, date_str)
-        transcripts_dir = cfg.transcripts_path / subfolder if subfolder else cfg.transcripts_path
-        transcript_filename = resolve_filename(cfg.transcript_filename_pattern, slug, date_str) + ".md"
-        print(f"\nNote saved      : {note_path}")
-        print(f"Transcript saved: {transcripts_dir / transcript_filename}")
+        path = save_transcript_only(content, title, date_str, cfg, meeting_id=meeting_id)
+        print(f"Transcript saved: {path}")
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Zoom Notes — extract and summarize Zoom transcripts",
+        description="Zoom Notes — extract and save Zoom transcripts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -2484,8 +1797,8 @@ def main() -> None:
     group.add_argument("--list", action="store_true", help="List recent meetings found in WAL")
     group.add_argument("--dump", action="store_true", help="Print current transcript to stdout")
     group.add_argument("--watch", action="store_true", help="Live-follow transcript during a meeting")
-    group.add_argument("--notes", action="store_true", help="Generate and save meeting notes")
-    parser.add_argument("--dry-run", action="store_true", help="Preview notes without saving (use with --notes)")
+    group.add_argument("--save", action="store_true", help="Save the current meeting transcript")
+    parser.add_argument("--dry-run", action="store_true", help="Preview the transcript without saving (use with --save)")
 
     args = parser.parse_args()
 
@@ -2504,8 +1817,8 @@ def main() -> None:
         cmd_dump(origin)
     elif args.watch:
         cmd_watch(origin)
-    elif args.notes:
-        cmd_notes(origin, dry_run=args.dry_run)
+    elif args.save:
+        cmd_save(origin, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

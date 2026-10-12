@@ -21,13 +21,10 @@ struct EngineEvent: Decodable {
     let transcriptPath: String?
     let attendees: [String]?
 
-    // Present on "error" and "note_failed" events
+    // Present on "error" and "transcript_failed" events
     let message: String?
 
-    // Present on "note_failed" events
-    let notePath: String?
-
-    // Present on "done" and "note_failed" events emitted by the abandoned-
+    // Present on "done" and "transcript_failed" events emitted by the abandoned-
     // meeting (back-to-back) generation path. The main engine loop stays
     // ACTIVE while this runs in the background, so these events must NOT
     // reset the UI to idle — the state events already reflect the real
@@ -43,7 +40,7 @@ struct EngineEvent: Decodable {
     let count: Int?
 
     // Present on "recovery_available" events (one per persisted accumulator
-    // found at engine startup — survivors of a prior crash or LLM failure).
+    // found at engine startup — survivors of a prior crash or save failure).
     let entryCount: Int?
     let lastUpdated: String?
     let slugHint: String?
@@ -61,7 +58,6 @@ struct EngineEvent: Decodable {
         case meetingId = "meeting_id"
         case title
         case path
-        case notePath = "note_path"
         case transcriptPath = "transcript_path"
         case attendees
         case message
@@ -83,14 +79,14 @@ struct EngineEvent: Decodable {
 enum EngineState: String {
     case idle
     case active
-    case generating
+    case saving
     case unknown
 
     init(_ rawValue: String?) {
         switch rawValue {
         case "idle":       self = .idle
         case "active":     self = .active
-        case "generating": self = .generating
+        case "saving": self = .saving
         default:           self = .unknown
         }
     }

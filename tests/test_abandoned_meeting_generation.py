@@ -184,7 +184,7 @@ class TestAbandonedGenerationMixedMeetingIds:
     passes), but after filtering to meeting A's id only 3 entries remained.
     The abandoned generation ran and produced a near-empty, misleading note.
 
-    The fix: inside _trigger_abandoned_generation the worker re-runs
+    The fix: inside _trigger_abandoned_save the worker re-runs
     _abandoned_looks_real on the *filtered* entries and bails out if they
     are below threshold.
     """
@@ -208,11 +208,11 @@ class TestAbandonedGenerationMixedMeetingIds:
         self, isolated_cache, isolated_vault, monkeypatch
     ):
         """If only meeting-A entries are below threshold but total snapshot
-        is above it, the worker must bail out without calling summarize."""
+        is above it, the worker must bail out without saving a transcript."""
         import zoom_engine as ze
 
-        seen_summarize = []
-        monkeypatch.setattr(ze, "summarize", lambda *a, **kw: seen_summarize.append(1) or "summary")
+        seen_saves = []
+        monkeypatch.setattr(ZoomEngine, "_write_transcript", lambda *a, **kw: seen_saves.append(1) or Path("transcript.md"))
 
         engine = ZoomEngine()
 
@@ -227,14 +227,15 @@ class TestAbandonedGenerationMixedMeetingIds:
         # But only 3 entries belong to meeting A
         assert ZoomEngine._abandoned_looks_real(snap_a) is False  # A-only fails
 
-        engine._trigger_abandoned_generation("meeting-A-AA", mixed_snapshot)
+        monkeypatch.setattr(threading.Thread, "start", lambda worker: worker.run())
+        engine._trigger_abandoned_save("meeting-A-AA", mixed_snapshot)
 
         # Wait for the worker to finish (it holds the lock while running)
-        assert engine._generating_lock.acquire(timeout=5.0), "worker never released lock"
-        engine._generating_lock.release()
+        assert engine._saving_lock.acquire(timeout=5.0), "worker never released lock"
+        engine._saving_lock.release()
 
-        assert seen_summarize == [], (
-            "_trigger_abandoned_generation must not call summarize when "
+        assert seen_saves == [], (
+            "_trigger_abandoned_save must not save a transcript when "
             "filtered entries are below threshold"
         )
 
@@ -245,9 +246,8 @@ class TestAbandonedGenerationMixedMeetingIds:
         generation still runs even if the total snapshot is mixed."""
         import zoom_engine as ze
 
-        seen_summarize = []
-        monkeypatch.setattr(ze, "summarize", lambda *a, **kw: seen_summarize.append(1) or "## Overview\n\nOK")
-        monkeypatch.setattr(ze, "generate_title", lambda *a, **kw: None)
+        seen_saves = []
+        monkeypatch.setattr(ZoomEngine, "_write_transcript", lambda *a, **kw: seen_saves.append(1) or Path("transcript.md"))
         monkeypatch.setattr(ze, "find_origin_dir", lambda: None)
 
         engine = ZoomEngine()
@@ -258,13 +258,14 @@ class TestAbandonedGenerationMixedMeetingIds:
         snap_b = self._make_snapshot_for_meeting("meeting-B-BB", count=4, prefix="b")
         mixed_snapshot = {**snap_a, **snap_b}
 
-        engine._trigger_abandoned_generation("meeting-A-BB", mixed_snapshot)
+        monkeypatch.setattr(threading.Thread, "start", lambda worker: worker.run())
+        engine._trigger_abandoned_save("meeting-A-BB", mixed_snapshot)
 
-        assert engine._generating_lock.acquire(timeout=5.0), "worker never released lock"
-        engine._generating_lock.release()
+        assert engine._saving_lock.acquire(timeout=5.0), "worker never released lock"
+        engine._saving_lock.release()
 
-        assert seen_summarize == [1], (
-            "_trigger_abandoned_generation must call summarize when "
+        assert seen_saves == [1], (
+            "_trigger_abandoned_save must save a transcript when "
             "filtered entries are above threshold"
         )
 
@@ -308,7 +309,7 @@ class TestCaseBDispatch:
         # Tick 3: Case B — meeting B detected with only a couple of entries.
         # Generation must NOT fire (could be a flap); A is parked pending.
         b_entries_small = list(_make_realistic_accumulator("MEETING-B==", count=2).values())
-        with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
+        with patch.object(ZoomEngine, "_trigger_abandoned_save") as mock_dispatch:
             _drive_tick(
                 engine, fake_origin, cfg, wal=synthetic_wal,
                 mtime=1010.0, size=12288, entries=b_entries_small,
@@ -325,7 +326,7 @@ class TestCaseBDispatch:
         # Tick 4: meeting B accumulates real content of its own — a genuine
         # back-to-back boundary. Now A's deferred note fires, exactly once.
         b_entries_full = list(_make_realistic_accumulator("MEETING-B==", count=6).values())
-        with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
+        with patch.object(ZoomEngine, "_trigger_abandoned_save") as mock_dispatch:
             _drive_tick(
                 engine, fake_origin, cfg, wal=synthetic_wal,
                 mtime=1015.0, size=16384, entries=b_entries_full,
@@ -373,7 +374,7 @@ class TestCaseBDispatch:
             detected_meeting_id="MEETING-A==",
         )
 
-        with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
+        with patch.object(ZoomEngine, "_trigger_abandoned_save") as mock_dispatch:
             # Flip to phantom B (1 entry) — A parked, nothing generated.
             b_entries = list(_make_realistic_accumulator("MEETING-B==", count=1).values())
             _drive_tick(
@@ -446,7 +447,7 @@ class TestCaseBDispatch:
         # Switch tick: detection flips to B, AND the WAL has been checkpointed
         # (empty parse) so B's opening lines are NO LONGER recoverable from the
         # WAL. Patch abandoned-generation so we don't hit the network.
-        with patch.object(ZoomEngine, "_trigger_abandoned_generation"):
+        with patch.object(ZoomEngine, "_trigger_abandoned_save"):
             _drive_tick(
                 engine, fake_origin, cfg, wal=synthetic_wal,
                 mtime=1015.0, size=16384, entries=[],
@@ -493,7 +494,7 @@ class TestCaseBDispatch:
         )
 
         b_entries = list(_make_realistic_accumulator("REAL-MEETING==", count=2).values())
-        with patch.object(ZoomEngine, "_trigger_abandoned_generation") as mock_dispatch:
+        with patch.object(ZoomEngine, "_trigger_abandoned_save") as mock_dispatch:
             _drive_tick(
                 engine, fake_origin, cfg, wal=synthetic_wal,
                 mtime=1010.0, size=12288, entries=b_entries,
@@ -505,164 +506,36 @@ class TestCaseBDispatch:
 # ── Worker behavior ───────────────────────────────────────────────────────
 
 
-class TestAbandonedGenerationWorker:
-    """The generation worker must save BOTH transcript and note (Stage 1
-    + Stage 3 of `_generate_notes`) and must not freeze the engine."""
-
-    def _seed_active(self, engine, fake_origin, synthetic_wal, cfg):
-        """Drive engine into ACTIVE so the lock + state machinery is live."""
-        _drive_tick(
-            engine, fake_origin, cfg, wal=synthetic_wal,
-            mtime=1000.0, size=4096, entries=[],
-            detected_meeting_id="ACTIVE==",
-        )
-        _drive_tick(
-            engine, fake_origin, cfg, wal=synthetic_wal,
-            mtime=1005.0, size=8192,
-            entries=list(_make_realistic_accumulator("ACTIVE==", count=2).values()),
-            detected_meeting_id="ACTIVE==",
-        )
-
-    def test_worker_saves_transcript_and_note_to_vault(
-        self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
-    ):
+class TestAbandonedTranscriptSaving:
+    def test_back_to_back_saves_both_transcripts_without_pausing_capture(self, isolated_cache, isolated_vault, monkeypatch):
         engine = ZoomEngine()
-        cfg = engine._get_cfg()
-        self._seed_active(engine, fake_origin, synthetic_wal, cfg)
-
-        snapshot = _make_realistic_accumulator("ABANDONED==", count=8)
-        finished = threading.Event()
-        # Patch summarize so we don't hit the network. Stub returns a
-        # short fake note body.
-        def fake_summarize(transcript_text, meeting_title, cfg, cancel_event=None):
-            return "## Overview\n\nFake LLM-generated summary for tests."
-
-        # Need find_origin_dir to return something so the worker can
-        # resolve blocks/transcript WALs (it'll get None back from
-        # _resolve_wal which is fine — _derive_meeting_title falls back
-        # to a "Zoom Meeting <date> <time>" label).
-        with patch.object(zoom_engine, "summarize", side_effect=fake_summarize), \
-             patch.object(zoom_engine, "generate_title", return_value=None), \
-             patch.object(zoom_engine, "find_origin_dir", return_value=fake_origin), \
-             patch.object(engine, "_resolve_wal", return_value=None):
-            engine._trigger_abandoned_generation("ABANDONED==", snapshot)
-            # Worker is daemon — wait for it to release the lock to know
-            # it finished. acquire(timeout=5) returns True once the worker
-            # is done and has released.
-            assert engine._generating_lock.acquire(timeout=5.0), (
-                "abandoned-generation worker did not finish within 5s"
-            )
-            engine._generating_lock.release()
-
-        # Transcript file must exist somewhere under the vault.
-        transcript_files = list(Path(isolated_vault["transcripts"]).rglob("*.md"))
-        note_files = list(Path(isolated_vault["notes"]).rglob("*.md"))
-        assert len(transcript_files) == 1, (
-            f"expected exactly one transcript file, got: {transcript_files}"
-        )
-        assert len(note_files) == 1, (
-            f"expected exactly one note file, got: {note_files}"
-        )
-        # Note must contain the fake LLM body — proves we actually wrote
-        # the LLM result, not a placeholder.
-        assert "Fake LLM-generated summary" in note_files[0].read_text()
-
-    def test_worker_does_not_freeze_engine_state(
-        self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
-    ):
-        """The whole point of the design: the engine must stay ACTIVE for
-        the new meeting while the abandoned one's note is being generated.
-        If the worker called `_set_state(GENERATING)`, the main loop would
-        stop polling and lose new-meeting transcript content."""
-        engine = ZoomEngine()
-        cfg = engine._get_cfg()
-        self._seed_active(engine, fake_origin, synthetic_wal, cfg)
+        engine._set_state(EngineState.ACTIVE)
+        monkeypatch.setattr(zoom_engine, "find_origin_dir", lambda: None)
+        real_save = engine._write_transcript
+        entered, release = threading.Event(), threading.Event()
+        completed = []
+        def gated_save(*args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return real_save(*args, **kwargs)
+        monkeypatch.setattr(engine, "_write_transcript", gated_save)
+        real_delete = zoom_engine.delete_persisted_accumulator
+        def cleanup(mid):
+            real_delete(mid)
+            completed.append(mid)
+        monkeypatch.setattr(zoom_engine, "delete_persisted_accumulator", cleanup)
+        engine._trigger_abandoned_save("A==", _make_realistic_accumulator("A==", count=8))
+        assert entered.wait(5)
         assert engine._get_state() == EngineState.ACTIVE
-
-        snapshot = _make_realistic_accumulator("ABANDONED==", count=8)
-        # Use a slow summarize so the worker is still running when we check.
-        slow = threading.Event()
-        def slow_summarize(*args, **kwargs):
-            slow.wait(timeout=2.0)
-            return "## Overview\n\nDone."
-
-        with patch.object(zoom_engine, "summarize", side_effect=slow_summarize), \
-             patch.object(zoom_engine, "generate_title", return_value=None), \
-             patch.object(zoom_engine, "find_origin_dir", return_value=fake_origin), \
-             patch.object(engine, "_resolve_wal", return_value=None):
-            engine._trigger_abandoned_generation("ABANDONED==", snapshot)
-            # Worker is now running summarize() and blocked on `slow`.
-            # Engine state must still be ACTIVE — not GENERATING.
-            assert engine._get_state() == EngineState.ACTIVE, (
-                f"engine flipped state during abandoned generation: {engine._get_state()}"
-            )
-            # Release the worker so it finishes cleanly.
-            slow.set()
-            assert engine._generating_lock.acquire(timeout=5.0)
-            engine._generating_lock.release()
-
-    def test_back_to_back_boundaries_serialize_through_lock(
-        self, fake_origin, synthetic_wal, isolated_cache, isolated_vault
-    ):
-        """Two abandoned-generation calls in quick succession (A -> B -> C
-        scenario) must both run, serializing through `_generating_lock`."""
-        engine = ZoomEngine()
-        cfg = engine._get_cfg()
-        self._seed_active(engine, fake_origin, synthetic_wal, cfg)
-
-        invocations = []
-        invocation_lock = threading.Lock()
-
-        def tracking_summarize(transcript_text, meeting_title, cfg, cancel_event=None):
-            # Record which meeting we're summarizing for (extracted from title
-            # or transcript). Use the meeting_title as a proxy; in this test
-            # both will match the same date-stamp fallback, so we record by
-            # transcript content instead — each snapshot has unique text.
-            with invocation_lock:
-                # Find which of the two meeting ids we're generating for
-                # by looking at the transcript content.
-                if "ABANDONED-A" in transcript_text:
-                    invocations.append("A")
-                elif "ABANDONED-B" in transcript_text:
-                    invocations.append("B")
-            return "## Overview\n\nDone."
-
-        def tagged_snapshot(tag: str) -> dict:
-            return {
-                f"{tag}-msg-{i}": _make_entry(
-                    f"{tag}-msg-{i}",
-                    f"{tag} content number {i}.",  # unique per tag
-                    meeting_id=f"{tag}==",
-                    speaker="Alice",
-                    timestamp=f"13:0{i}:00",
-                )
-                for i in range(6)
-            }
-
-        snap_a = tagged_snapshot("ABANDONED-A")
-        snap_b = tagged_snapshot("ABANDONED-B")
-
-        with patch.object(zoom_engine, "summarize", side_effect=tracking_summarize), \
-             patch.object(zoom_engine, "generate_title", return_value=None), \
-             patch.object(zoom_engine, "find_origin_dir", return_value=fake_origin), \
-             patch.object(engine, "_resolve_wal", return_value=None):
-            engine._trigger_abandoned_generation("ABANDONED-A==", snap_a)
-            engine._trigger_abandoned_generation("ABANDONED-B==", snap_b)
-
-            # Both workers are queued on `_generating_lock`. Wait for both
-            # to finish by polling until two invocations have been recorded.
-            import time
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                with invocation_lock:
-                    if len(invocations) == 2:
-                        break
-                time.sleep(0.05)
-
-        with invocation_lock:
-            assert len(invocations) == 2, (
-                f"expected both A and B to run, got: {invocations}"
-            )
-            assert sorted(invocations) == ["A", "B"], (
-                f"expected one A and one B invocation, got: {invocations}"
-            )
+        engine._trigger_abandoned_save("B==", _make_realistic_accumulator("B==", count=8))
+        release.set()
+        import time
+        deadline = time.monotonic() + 5
+        while len(completed) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sorted(completed) == ["A==", "B=="]
+        assert engine._get_state() == EngineState.ACTIVE
+        files = list(Path(isolated_vault["transcripts"]).rglob("*.md"))
+        assert len(files) == 2
+        assert {zoom_notes._read_existing_meeting_id(p) for p in files} == {"A==", "B=="}
+        assert all("Utterance" in p.read_text() or "utterance" in p.read_text() for p in files)

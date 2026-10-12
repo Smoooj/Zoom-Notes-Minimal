@@ -156,7 +156,7 @@ Readable via `strings` on that WAL too — look for lines that follow
 ### Option A — Obsidian Plugin (TypeScript)
 - Use Node's `fs.watch` on the WAL file path
 - Parse with a Buffer → UTF-8 string scan (same algorithm as above)
-- On meeting end (idle detection), call Claude API and write a note via
+- On meeting end (idle detection), save the raw transcript via
   Obsidian's `vault.create()` API
 - Benefit: lives entirely inside Obsidian, no separate process needed
 
@@ -165,13 +165,13 @@ Readable via `strings` on that WAL too — look for lines that follow
 - Parse the WAL in-process (no `strings` subprocess needed — just scan
   the file for UTF-8 sequences between null bytes)
 - Show live transcript in a floating HUD
-- On end: POST to Claude API, write `.md` to vault folder
+- On end: write the raw transcript as `.md` to vault folder
 - Benefit: native, zero dependencies, menu bar icon shows recording state
 
 ### Option C — Standalone Python Script
 - Single file, no dependencies beyond stdlib
 - Run manually after a meeting or via `--watch` mode
-- Uses `strings` subprocess + `urllib` for Claude API
+- Uses `strings` subprocess for local transcript extraction
 - Benefit: simplest to inspect, modify, and understand
 
 ---
