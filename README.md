@@ -35,14 +35,18 @@ make install-hooks
 ./scripts/fetch-python-runtime.sh
 xcodebuild -project ZoomNotesApp/ZoomNotesApp.xcodeproj \
   -scheme ZoomNotesApp -configuration Debug \
-  -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO build
+  -derivedDataPath build/DerivedData \
+  CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual build
+open "build/DerivedData/Build/Products/Debug/Zoom Notes.app"
 ```
 
-The build contains the Swift app, the Python engine, and a bundled Python runtime. For a signed local installation, review `scripts/install-local.sh` and run `make install`.
+The build contains the Swift app, the Python engine, and a bundled Python runtime. To build and install a local copy in Applications, run `./scripts/install-local.sh --debug`. Ad-hoc signing works without a developer certificate. Developer ID distribution requires configuring your signing identity and team.
+
+The Python build phase signs native libraries and the interpreter together. It enables hardened runtime only with a developer certificate; enabling it on ad-hoc Python causes macOS to reject its own libraries. Signing failures stop the build. `CODE_SIGNING_ALLOWED=NO` skips this signing step.
 
 Once running, open **Settings → Output** to choose a transcript folder and filename pattern. **Advanced** controls the polling interval, idle threshold, database hints, and blocked meetings.
 
-The menu bar item displays only an icon. Its menu offers **Save Transcript Now**, shows the last saved transcript, and provides recovery or retry options after a crash or failed file write.
+The menu bar item displays only an icon. The app does not request notification permission or send alerts. Its menu offers **Save Transcript Now**, shows the last saved transcript, and provides recovery or retry options after a crash or failed file write.
 
 Existing transcript output preferences are preserved when loading older settings files. Removed model, prompt, and summary-output fields are ignored. Previously stored credentials are not read or modified.
 
@@ -63,7 +67,7 @@ Optional overrides are documented in `.env.example`: `ZOOM_NOTES_TRANSCRIPTS_DIR
 - `zoom_notes.py`: cache discovery, transcript parsing, deduplication, local persistence, and Markdown writing.
 - `zoom_config.py`: local output and capture preferences.
 - `zoom_engine.py`: background capture, idle detection, meeting isolation, saving, and recovery.
-- `ZoomNotesApp/`: Swift/SwiftUI menu bar app, settings and notifications.
+- `ZoomNotesApp/`: Swift/SwiftUI menu bar app, settings.
 
 Capture snapshots survive engine restarts. Failed saves remain recoverable in the existing cache retention flow. Recovery saves the raw transcript and can run while another meeting is being captured.
 

@@ -7,7 +7,6 @@
 
 import Foundation
 import Combine
-import UserNotifications
 
 /// Metadata for retrying a failed transcript save.
 struct FailedMeeting: Equatable {
@@ -173,7 +172,6 @@ class AppState: ObservableObject {
                 lastSavedTitle = title
                 lastSavedPath = event.path
                 lastSavedTranscriptPath = event.transcriptPath
-                sendTranscriptSavedNotification(title: title, path: event.path)
             }
             // A successful "done" supersedes any prior failure for the same
             // meeting (this is what the retry path emits on success).
@@ -209,7 +207,6 @@ class AppState: ObservableObject {
                 lastSavedTitle = failure.title
                 lastSavedTranscriptPath = path
             }
-            sendTranscriptFailedNotification(failure: failure)
         case "error":
             engineError = event.message
             engineState = .idle
@@ -246,52 +243,5 @@ class AppState: ObservableObject {
 
     func clearMeetingCache() {
         engineManager.sendCommand(["cmd": "clear_cache"])
-    }
-
-    // MARK: - Notifications
-
-    private func sendTranscriptSavedNotification(title: String, path: String?) {
-        let content = UNMutableNotificationContent()
-        content.title = "Meeting Transcript Saved"
-        content.body = title
-        content.sound = .default
-        content.categoryIdentifier = "MEETING_SAVED"
-        if let path {
-            content.userInfo = ["transcriptPath": path]
-        }
-        let request = UNNotificationRequest(
-            identifier: "zoom-notes-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                log("[Notifications] failed to post note-saved alert: \(error.localizedDescription)",
-                    level: .error)
-            }
-        }
-    }
-
-    private func sendTranscriptFailedNotification(failure: FailedMeeting) {
-        let content = UNMutableNotificationContent()
-        content.title = "Transcript Save Failed"
-        content.body = "\(failure.title) — transcript retained for retry. \(failure.message)"
-        content.sound = .default
-        content.categoryIdentifier = "TRANSCRIPT_FAILED"
-        content.userInfo = [
-            "meetingId": failure.meetingId,
-            "transcriptPath": failure.transcriptPath ?? "",
-        ]
-        let request = UNNotificationRequest(
-            identifier: "zoom-notes-failed-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                log("[Notifications] failed to post note-failed alert: \(error.localizedDescription)",
-                    level: .error)
-            }
-        }
     }
 }

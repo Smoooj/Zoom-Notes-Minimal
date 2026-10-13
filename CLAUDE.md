@@ -9,9 +9,9 @@ This fork captures Zoom My Notes transcripts and saves them locally. It has no m
 - `zoom_notes.py`: discovers Zoom WebKit cache buckets, identifies transcript and title databases by content, parses and deduplicates speech, persists recovery snapshots, and writes collision-safe Markdown transcripts.
 - `zoom_config.py`: local JSON preferences and output path helpers.
 - `zoom_engine.py`: polls every configured interval, accumulates speech, detects idle/boundary changes, saves transcripts, and exposes recovery commands.
-- `ZoomNotesApp/ZoomNotesApp/`: Swift/SwiftUI menu bar application. `EngineManager` starts the Python child and drains stdout and stderr. `AppState` translates engine events into menu state and notifications.
+- `ZoomNotesApp/ZoomNotesApp/`: Swift/SwiftUI menu bar application. `EngineManager` starts the Python child and drains stdout and stderr. `AppState` translates engine events into menu state.
 
-The menu bar status item is icon-only in every engine state. There is no calendar access or upcoming-meeting system.
+The menu bar status item is icon-only in every engine state. There is no calendar access, upcoming-meeting system, or user notification functionality.
 
 Runtime dependencies are Python's standard library, the macOS `strings` command, and Apple frameworks. Pytest is test-only. The app bundles Python 3.12 via `scripts/fetch-python-runtime.sh`.
 

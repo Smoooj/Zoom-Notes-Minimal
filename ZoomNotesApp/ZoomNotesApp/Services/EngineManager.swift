@@ -106,7 +106,9 @@ class EngineManager: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pythonPath)
-        proc.arguments = [scriptPath]
+        // Keep the signed app bundle immutable: Python's import caches would
+        // otherwise modify sealed resources and invalidate its signature.
+        proc.arguments = ["-B", scriptPath]
 
         let projectRoot = findProjectRoot()
         if let root = projectRoot {
@@ -266,22 +268,33 @@ class EngineManager: ObservableObject {
 
     private func checkPythonVersion(at pythonPath: String) {
         let task = Process()
-        task.launchPath = pythonPath
-        task.arguments = ["-c", "import sys; v=sys.version_info; exit(0 if v>=(3,10) else 1)"]
-        try? task.run()
+        task.executableURL = URL(fileURLWithPath: pythonPath)
+        // Reserve an explicit exit code for a successfully executed version
+        // check. A loader crash or launch failure says nothing about version.
+        task.arguments = ["-B", "-c", "import sys; sys.exit(64 if sys.version_info < (3, 10) else 0)"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            log("[EngineManager] Python version check could not launch: \(error.localizedDescription)", level: .error)
+            return
+        }
         task.waitUntilExit()
-        if task.terminationStatus != 0 {
+        if task.terminationReason == .exit && task.terminationStatus == 64 {
             DispatchQueue.main.async {
                 self.error = "Python 3.10+ is required but an older version was found. Install it with: brew install python3"
             }
             log("[EngineManager] Python version too old at \(pythonPath)", level: .error)
+        } else if task.terminationStatus != 0 {
+            log("[EngineManager] Python failed to run (status \(task.terminationStatus)); see engine stderr for details", level: .error)
         }
     }
 
     private func scheduleRestart() {
         guard restartCount < maxRestarts else {
             DispatchQueue.main.async {
-                self.error = "Engine failed to start. Check that Python 3.10+ is installed (brew install python3) and open logs for details."
+                self.error = "Engine failed to start. Open logs for details."
             }
             return
         }
