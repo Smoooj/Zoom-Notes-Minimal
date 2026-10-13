@@ -342,13 +342,13 @@ class TestLateJoinerDoesNotTriggerGeneration:
     Scenario: user joined Zoom alone, AI Notetaker initialized which made
     the WAL "active" from the engine's perspective. The other participant
     was 2 minutes late, so no real transcript entries arrived. The 90s
-    idle threshold elapsed and `_trigger_generate` fired anyway. The
+    idle threshold elapsed and `_trigger_save` fired anyway. The
     accumulator at that moment held only stale cross-meeting entries
     (Anna Punihaole [13:07:23] from a meeting hours earlier — Zoom keeps
     old utterances in WAL pages until checkpoint), and the LLM produced
     a "Mike Nick 11" note with Anna as the only speaker.
 
-    Post-fix: a gate before `_trigger_generate` checks the accumulator
+    Post-fix: a gate before `_trigger_save` checks the accumulator
     for at least one entry matching `active_meeting_id`. Without one,
     the engine disarms and returns to IDLE rather than handing stale
     data to the LLM.
@@ -361,10 +361,10 @@ class TestLateJoinerDoesNotTriggerGeneration:
 
         engine = ZoomEngine()
         cfg = engine._get_cfg()
-        # Sentinel: any call to _trigger_generate is a regression of the
+        # Sentinel: any call to _trigger_save is a regression of the
         # 2026-04-29 bug. Replace with a MagicMock that fails loudly.
-        engine._trigger_generate = MagicMock(side_effect=AssertionError(
-            "engine must NOT call _trigger_generate when the active meeting "
+        engine._trigger_save = MagicMock(side_effect=AssertionError(
+            "engine must NOT call _trigger_save when the active meeting "
             "has no entries in the accumulator (late-joiner / WAL-noise gate)"
         ))
 
@@ -398,7 +398,7 @@ class TestLateJoinerDoesNotTriggerGeneration:
         # Tick 3: WAL stops changing (late participant still hasn't
         # arrived) and we age `_last_active_ts` past the idle threshold.
         # The "not changed" branch should evaluate the gate and bail out
-        # cleanly instead of calling _trigger_generate.
+        # cleanly instead of calling _trigger_save.
         engine._write_tracking(active_ts=0.0)  # ancient ts → idle elapsed
         _drive_tick(
             engine, fake_origin, cfg, wal=synthetic_wal,
@@ -408,7 +408,7 @@ class TestLateJoinerDoesNotTriggerGeneration:
             detected_meeting_id="active_meeting",
         )
 
-        engine._trigger_generate.assert_not_called()
+        engine._trigger_save.assert_not_called()
         assert engine._get_state() == EngineState.IDLE, \
             "gate must disarm to IDLE so the next WAL change can re-arm cleanly"
         _, _, active_ts, _ = engine._read_tracking()
@@ -425,12 +425,11 @@ class TestLateJoinerDoesNotTriggerGeneration:
 
         engine = ZoomEngine()
         cfg = engine._get_cfg()
-        engine._trigger_generate = MagicMock()
+        engine._trigger_save = MagicMock()
 
         # Provide an API key so the existing API-key check (which runs
         # AFTER the new gate) doesn't return early and mask a regression.
         import zoom_config
-        monkeypatch.setattr(zoom_config, "get_api_key", lambda *_: "sk-test")
 
         _drive_tick(
             engine, fake_origin, cfg, wal=synthetic_wal,
@@ -459,15 +458,15 @@ class TestLateJoinerDoesNotTriggerGeneration:
                                  meeting_id="active_meeting", speaker="Alex")],
             detected_meeting_id="active_meeting",
         )
-        assert engine._trigger_generate.called, (
+        assert engine._trigger_save.called, (
             "gate must allow trigger when accumulator has real content for "
             "active meeting"
         )
-        assert engine._trigger_generate.call_count == 1
+        assert engine._trigger_save.call_count == 1
 
 
 class TestCollectEntriesForGenerationFiltersStrictly:
-    """Direct unit tests on `_collect_entries_for_generation`. Must NEVER
+    """Direct unit tests on `_collect_entries_for_save`. Must NEVER
     fall back to the unfiltered accumulator when the meeting-id filter
     returns empty — that fallback was the 2026-04-29 contamination bug
     where stale cross-meeting WAL entries became the entire transcript
@@ -486,7 +485,7 @@ class TestCollectEntriesForGenerationFiltersStrictly:
         # self-heal path refuses to recover, so this falls back to the
         # original strict-filter contract: return [] rather than hand the
         # unrelated meetingA entries to the LLM.
-        entries, recovered_id = engine._collect_entries_for_generation(
+        entries, recovered_id = engine._collect_entries_for_save(
             transcript_wal=None, active_meeting_id="meetingB"
         )
         assert entries == [], (
@@ -508,7 +507,7 @@ class TestCollectEntriesForGenerationFiltersStrictly:
                 "real1":  _make_entry("real1", "alex",
                                       meeting_id="meetingB", speaker="Alex"),
             }
-        entries, recovered_id = engine._collect_entries_for_generation(
+        entries, recovered_id = engine._collect_entries_for_save(
             transcript_wal=None, active_meeting_id="meetingB"
         )
         assert len(entries) == 1
@@ -532,7 +531,7 @@ class TestCollectEntriesForGenerationFiltersStrictly:
                 "real1":  _make_entry("real1", "thanks",
                                       meeting_id="meetingB", speaker="Alex"),
             }
-        entries, _recovered_id = engine._collect_entries_for_generation(
+        entries, _recovered_id = engine._collect_entries_for_save(
             transcript_wal=None, active_meeting_id="meetingB"
         )
         msg_ids = {e["msg_id"] for e in entries}

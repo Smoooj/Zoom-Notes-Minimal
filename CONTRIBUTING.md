@@ -1,6 +1,6 @@
 # Contributing to Zoom Notes
 
-Thanks for your interest in contributing. This is a small, focused tool — contributions that fix bugs, improve reliability, or add support for new LLM providers are most welcome.
+Thanks for your interest in contributing. This is a small, focused tool — contributions that fix bugs, improve reliability, or improve local transcript capture are most welcome.
 
 ## Before you start
 
@@ -10,8 +10,8 @@ Thanks for your interest in contributing. This is a small, focused tool — cont
 ## Setup
 
 ```bash
-git clone https://github.com/nickybmon/Zoom-Notes.git
-cd Zoom-Notes
+git clone https://github.com/Smoooj/Zoom-Notes-Minimal.git
+cd Zoom-Notes-Minimal
 
 # Install git hooks (blocks accidental commits of WAL files and secrets)
 make install-hooks
@@ -34,8 +34,8 @@ make test
 ## Project structure
 
 ```
-zoom_notes.py       — WAL discovery, transcript parsing, LLM calls, note writing
-zoom_config.py      — Settings and Keychain helpers
+zoom_notes.py       — WAL discovery, transcript parsing, local saving
+zoom_config.py      — Local capture and output settings
 zoom_engine.py      — Headless poller spawned by the Swift app
 ZoomNotesApp/       — Swift/SwiftUI menu bar app
 tests/              — pytest suite
@@ -54,5 +54,4 @@ See `CLAUDE.md` for a detailed architecture walkthrough.
 Please include:
 - macOS version
 - Zoom version
-- Which LLM provider you're using
 - Relevant output from `python3 zoom_notes.py --list` or Console.app logs under `zoom-notes`

@@ -72,27 +72,14 @@ class EngineManager: ObservableObject {
         try? stdin.fileHandleForWriting.write(contentsOf: data)
     }
 
-    /// Reload settings: SIGHUP for config-only changes, full restart when API keys may have changed.
-    /// A full restart is required after key changes because the API keys are
-    /// injected into the engine's environment at spawn time — SIGHUP only
-    /// invalidates the Python config cache, not the env vars.
-    func reloadSettings(restartForNewKeys: Bool = true) {
+    /// Reload capture and output preferences without restarting the engine.
+    func reloadSettings() {
         guard let proc = process, proc.isRunning else {
-            // Engine isn't running at all — start it instead of failing silently.
-            log("[EngineManager] reloadSettings() called but engine isn't running — spawning", level: .info)
             spawnEngine()
             return
         }
-        if restartForNewKeys {
-            log("[EngineManager] Restarting engine to pick up new API keys", level: .info)
-            intentionalRestart = true
-            proc.terminate()
-            // The waitUntilExit() watcher in spawnEngine() will see
-            // intentionalRestart==true and re-spawn after the process dies.
-        } else {
-            kill(proc.processIdentifier, SIGHUP)
-            log("[EngineManager] Sent SIGHUP to engine (PID \(proc.processIdentifier))", level: .info)
-        }
+        kill(proc.processIdentifier, SIGHUP)
+        log("[EngineManager] Reloaded transcript settings", level: .info)
     }
 
     // MARK: - Private
@@ -119,7 +106,9 @@ class EngineManager: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pythonPath)
-        proc.arguments = [scriptPath]
+        // Keep the signed app bundle immutable: Python's import caches would
+        // otherwise modify sealed resources and invalidate its signature.
+        proc.arguments = ["-B", scriptPath]
 
         let projectRoot = findProjectRoot()
         if let root = projectRoot {
@@ -137,19 +126,6 @@ class EngineManager: ObservableObject {
         // Ensure the script's directory is on sys.path so zoom_config / zoom_notes imports resolve
         let scriptDir = URL(fileURLWithPath: scriptPath).deletingLastPathComponent().path
         env["PYTHONPATH"] = scriptDir + ":" + (env["PYTHONPATH"] ?? "")
-
-        // Inject API keys from Keychain so Python never needs to call `security`
-        // (avoids repeated keychain permission prompts for the python/security binaries)
-        let keyMap: [(account: String, envVar: String)] = [
-            ("anthropic_api_key", "ANTHROPIC_API_KEY"),
-            ("openai_api_key",    "OPENAI_API_KEY"),
-            ("gemini_api_key",    "GEMINI_API_KEY"),
-        ]
-        for pair in keyMap {
-            if let key = keychainGet(account: pair.account), !key.isEmpty {
-                env[pair.envVar] = key
-            }
-        }
 
         proc.environment = env
 
@@ -292,22 +268,33 @@ class EngineManager: ObservableObject {
 
     private func checkPythonVersion(at pythonPath: String) {
         let task = Process()
-        task.launchPath = pythonPath
-        task.arguments = ["-c", "import sys; v=sys.version_info; exit(0 if v>=(3,10) else 1)"]
-        try? task.run()
+        task.executableURL = URL(fileURLWithPath: pythonPath)
+        // Reserve an explicit exit code for a successfully executed version
+        // check. A loader crash or launch failure says nothing about version.
+        task.arguments = ["-B", "-c", "import sys; sys.exit(64 if sys.version_info < (3, 10) else 0)"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            log("[EngineManager] Python version check could not launch: \(error.localizedDescription)", level: .error)
+            return
+        }
         task.waitUntilExit()
-        if task.terminationStatus != 0 {
+        if task.terminationReason == .exit && task.terminationStatus == 64 {
             DispatchQueue.main.async {
                 self.error = "Python 3.10+ is required but an older version was found. Install it with: brew install python3"
             }
             log("[EngineManager] Python version too old at \(pythonPath)", level: .error)
+        } else if task.terminationStatus != 0 {
+            log("[EngineManager] Python failed to run (status \(task.terminationStatus)); see engine stderr for details", level: .error)
         }
     }
 
     private func scheduleRestart() {
         guard restartCount < maxRestarts else {
             DispatchQueue.main.async {
-                self.error = "Engine failed to start. Check that Python 3.10+ is installed (brew install python3) and open logs for details."
+                self.error = "Engine failed to start. Open logs for details."
             }
             return
         }

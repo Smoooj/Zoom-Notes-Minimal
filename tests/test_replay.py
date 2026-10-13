@@ -1,155 +1,142 @@
-"""Full-cycle replay tests: drive the engine through IDLE → ACTIVE → GENERATING
-against fixture WALs, with the LLM stubbed out, and assert the final note
-generation receives the right transcript.
-
-This is the integration-level regression guard for today's bug class.
-"""
-import os
-import shutil
+"""Local transcript finalization and recovery integration tests."""
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+import socket
+import threading
 
 import pytest
 
+import zoom_config
 import zoom_engine
 import zoom_notes
 from zoom_engine import EngineState, ZoomEngine
 
 
 @pytest.fixture
-def isolated_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(zoom_notes, "_CACHE_DIR", tmp_path / "zoom-notes-cache")
-    yield tmp_path / "zoom-notes-cache"
+def capture(tmp_path, monkeypatch):
+    cfg = zoom_config.ZoomNotesConfig(transcripts_dir=str(tmp_path / "Transcripts"))
+    monkeypatch.setattr(zoom_engine, "get_config", lambda: cfg)
+    monkeypatch.setattr(zoom_notes, "get_config", lambda: cfg)
+    monkeypatch.setattr(zoom_notes, "_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(zoom_engine, "find_origin_dir", lambda: None)
+    engine = ZoomEngine()
+    monkeypatch.setattr(engine, "_resolve_wal", lambda *args: None)
+    monkeypatch.setattr(engine, "_derive_meeting_title", lambda *args: "Weekly Sync")
+    events = []
+    monkeypatch.setattr(zoom_engine, "emit", events.append)
+    entry = {
+        "msg_id": "first", "meeting_id": "meeting_A", "speaker": "Alice",
+        "timestamp": datetime.now().strftime("%H:%M:%S"), "text": "Ship the update tomorrow.",
+    }
+    engine._accumulated = {"first": entry}
+    engine._write_tracking(meeting_id="meeting_A", session_mtime=1000)
+    zoom_notes.persist_accumulator("meeting_A", engine._accumulated)
+    return engine, cfg, events, entry
 
 
-@pytest.fixture
-def isolated_output_dirs(tmp_path, monkeypatch):
-    """Redirect notes_path and transcripts_path so save_* never writes to ~/Desktop."""
-    notes_dir = tmp_path / "Notes"
-    transcripts_dir = tmp_path / "Transcripts"
-    notes_dir.mkdir()
-    transcripts_dir.mkdir()
-
-    real_get_config = zoom_notes.get_config
-
-    def patched_get_config():
-        cfg = real_get_config()
-        # ZoomNotesConfig is a dataclass; mutate the in-memory copy so
-        # save_transcript_only / save_note_only land in tmp.
-        cfg.notes_dir = str(notes_dir)
-        cfg.transcripts_dir = str(transcripts_dir)
-        return cfg
-
-    monkeypatch.setattr(zoom_notes, "get_config", patched_get_config)
-    monkeypatch.setattr(zoom_engine, "get_config", patched_get_config)
-    return {"notes": notes_dir, "transcripts": transcripts_dir}
-
-
-@pytest.fixture
-def fake_origin(tmp_path):
-    origin = tmp_path / "origin"
-    origin.mkdir()
-    return origin
+def test_completion_saves_short_transcript_without_keys_or_network(capture, monkeypatch):
+    engine, cfg, events, entry = capture
+    def no_network(*args, **kwargs):
+        raise AssertionError("Saving a transcript must not open a network connection")
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    engine._trigger_save(Path("unused"), cfg)
+    assert engine._saving_lock.acquire(timeout=5)
+    engine._saving_lock.release()
+    files = list(cfg.transcripts_path.rglob("*.md"))
+    assert len(files) == 1
+    body = files[0].read_text()
+    assert "Ship the update tomorrow." in body
+    assert "Alice" in body
+    assert "meeting_id: meeting_A" in body
+    assert "\nnote:" not in body
+    assert engine._get_state() == EngineState.IDLE
+    assert zoom_notes.load_persisted_accumulator("meeting_A") is None
+    done = next(e for e in events if e["event"] == "done")
+    assert done["path"] == done["transcript_path"] == str(files[0])
+    assert not list(cfg.transcripts_path.parent.rglob("Notes/*.md"))
 
 
-@pytest.fixture
-def fixture_wal_path(multi_meeting_wal, tmp_path):
-    dest = tmp_path / "fixture-transcript.sqlite3-wal"
-    shutil.copy2(multi_meeting_wal, dest)
-    return dest
+def test_unknown_speaker_is_still_saved(capture):
+    engine, cfg, events, entry = capture
+    entry["speaker"] = "Unknown"
+    engine._save_transcript(Path("unused"), cfg)
+    assert "Unknown" in next(cfg.transcripts_path.rglob("*.md")).read_text()
 
 
-@pytest.fixture
-def fixture_blocks_path(multi_meeting_blocks, tmp_path):
-    dest = tmp_path / "fixture-blocks.sqlite3-wal"
-    shutil.copy2(multi_meeting_blocks, dest)
-    return dest
+def test_disk_failure_preserves_capture_and_retry_saves_transcript(capture, monkeypatch):
+    engine, cfg, events, entry = capture
+    real_save = zoom_engine.save_transcript_only
+    def deny_write(*args, **kwargs):
+        raise PermissionError("Output folder is not writable")
+    monkeypatch.setattr(zoom_engine, "save_transcript_only", deny_write)
+    engine._trigger_save(Path("unused"), cfg)
+    assert engine._saving_lock.acquire(timeout=5)
+    engine._saving_lock.release()
+    assert engine._last_run_save_failed
+    assert zoom_notes.load_persisted_accumulator("meeting_A")
+    assert any(e["event"] == "transcript_failed" for e in events)
+    assert engine._get_state() == EngineState.IDLE
+    monkeypatch.setattr(zoom_engine, "save_transcript_only", real_save)
+    engine._trigger_retry("meeting_A")
+    assert engine._saving_lock.acquire(timeout=5)
+    engine._saving_lock.release()
+    assert len(list(cfg.transcripts_path.rglob("*.md"))) == 1
+    assert zoom_notes.load_persisted_accumulator("meeting_A") is None
+    assert engine._last_failed_meeting is None
 
 
-def _drive_tick(engine, origin, cfg, mtime, size, fixture_wal):
-    os.utime(fixture_wal, (mtime, mtime))
-    with patch.object(zoom_engine, "find_wal", return_value=fixture_wal):
-        engine._poll_once(origin, cfg, idle_threshold=cfg.idle_threshold_secs)
+def test_recovery_saves_transcript_without_pausing_live_capture(capture):
+    engine, cfg, events, entry = capture
+    engine._set_state(EngineState.ACTIVE)
+    engine._trigger_retry("meeting_A")
+    assert engine._saving_lock.acquire(timeout=5)
+    engine._saving_lock.release()
+    assert engine._get_state() == EngineState.ACTIVE
+    assert next(e for e in events if e["event"] == "done")["background"] is True
+    assert "Ship the update" in next(cfg.transcripts_path.rglob("*.md")).read_text()
 
 
-class TestReplay:
-    def test_full_cycle_generates_note_with_correct_meeting(
-        self,
-        fake_origin,
-        fixture_wal_path,
-        fixture_blocks_path,
-        isolated_cache,
-        isolated_output_dirs,
-        multi_meeting_meta,
-    ):
-        """Walk the engine through a full meeting and confirm:
-            1. The transcript is saved BEFORE the LLM is called (durability).
-            2. The note is generated for the correct meeting.
-            3. After success, the persisted accumulator is cleaned up.
-        """
-        engine = ZoomEngine()
-        cfg = engine._get_cfg()
+def test_cancelled_save_does_not_write_and_keeps_recovery_snapshot(capture):
+    engine, cfg, events, entry = capture
+    engine._cancel_event.set()
+    engine._save_transcript(Path("unused"), cfg)
+    assert not list(cfg.transcripts_path.rglob("*.md"))
+    assert zoom_notes.load_persisted_accumulator("meeting_A")
+    assert any(e["event"] == "transcript_failed" for e in events)
 
-        size = fixture_wal_path.stat().st_size
-        _drive_tick(engine, fake_origin, cfg, 1000.0, size, fixture_wal_path)
-        _drive_tick(engine, fake_origin, cfg, 1005.0, size + 1, fixture_wal_path)
-        assert engine._get_state() == EngineState.ACTIVE
 
-        # Stub LLM and find_wal for the generation path. Patch the symbol
-        # in zoom_engine's namespace because zoom_engine does
-        # `from zoom_notes import summarize` at import time.
-        with patch.object(zoom_engine, "summarize", return_value="(summary)"), \
-             patch.object(zoom_engine, "generate_title", return_value=None), \
-             patch.object(zoom_engine, "find_wal", return_value=fixture_wal_path):
-            engine._generate_notes(fake_origin, cfg)
+def test_cli_save_and_dry_run_use_the_same_transcript_writer(tmp_path, monkeypatch, capsys):
+    cfg = zoom_config.ZoomNotesConfig(transcripts_dir=str(tmp_path / "Transcripts"))
+    wal = tmp_path / "transcript.sqlite3-wal"
+    wal.write_bytes(b"test")
+    entry = {"speaker": "Alice", "timestamp": "11:00:00", "text": "Keep this verbatim.", "msg_id": "1", "meeting_id": "A"}
+    monkeypatch.setattr(zoom_notes, "get_config", lambda: cfg)
+    monkeypatch.setattr(zoom_notes, "find_wal", lambda *args, **kwargs: wal)
+    monkeypatch.setattr(zoom_notes, "detect_active_meeting_id", lambda *args: "A")
+    monkeypatch.setattr(zoom_notes, "parse_transcript", lambda *args, **kwargs: [entry])
+    monkeypatch.setattr(zoom_notes, "parse_meeting_title", lambda *args: "Test Meeting")
+    zoom_notes.cmd_save(tmp_path, dry_run=True)
+    assert "Keep this verbatim." in capsys.readouterr().out
+    assert not cfg.transcripts_path.exists()
+    zoom_notes.cmd_save(tmp_path)
+    assert "Keep this verbatim." in next(cfg.transcripts_path.rglob("*.md")).read_text()
 
-        # A transcript must exist on disk in the user-visible folder.
-        transcripts_root = isolated_output_dirs["transcripts"]
-        transcripts = list(transcripts_root.rglob("*.md"))
-        assert transcripts, "transcript must be saved to user folder"
 
-        notes_root = isolated_output_dirs["notes"]
-        notes = list(notes_root.rglob("*.md"))
-        assert notes, "note must be saved on LLM success"
+def test_legacy_model_settings_are_ignored_and_output_is_preserved():
+    cfg = zoom_config._config_from_dict({
+        "llm_provider": "openai", "llm_model": "old-model", "system_prompt": "old prompt",
+        "notes_dir": "/unused", "openai_base_url": "https://invalid.test",
+        "transcripts_dir": "/existing/transcripts", "subfolder_pattern": "month",
+    })
+    assert cfg.transcripts_dir == "/existing/transcripts"
+    assert cfg.subfolder_pattern == "month"
+    assert not hasattr(cfg, "llm_provider")
+    assert not hasattr(zoom_config, "get_api_key")
+    assert not hasattr(zoom_notes, "summarize")
 
-        # The note body should contain our stub summary.
-        note_text = notes[0].read_text()
-        assert "(summary)" in note_text
 
-    def test_llm_failure_writes_placeholder_and_keeps_transcript(
-        self,
-        fake_origin,
-        fixture_wal_path,
-        fixture_blocks_path,
-        isolated_cache,
-        isolated_output_dirs,
-    ):
-        """When the LLM raises, the transcript is still saved and a placeholder
-        note is written with retry metadata."""
-        engine = ZoomEngine()
-        cfg = engine._get_cfg()
-
-        size = fixture_wal_path.stat().st_size
-        _drive_tick(engine, fake_origin, cfg, 1000.0, size, fixture_wal_path)
-        _drive_tick(engine, fake_origin, cfg, 1005.0, size + 1, fixture_wal_path)
-
-        def boom(*a, **kw):
-            raise RuntimeError("LLM API error 503: server unavailable")
-
-        with patch.object(zoom_engine, "summarize", side_effect=boom), \
-             patch.object(zoom_engine, "generate_title", return_value=None), \
-             patch.object(zoom_engine, "find_wal", return_value=fixture_wal_path):
-            engine._generate_notes(fake_origin, cfg)
-
-        transcripts = list(isolated_output_dirs["transcripts"].rglob("*.md"))
-        assert transcripts, "transcript must be saved even when LLM fails"
-
-        notes = list(isolated_output_dirs["notes"].rglob("*.md"))
-        assert notes, "placeholder note must be saved on LLM failure"
-        body = notes[0].read_text()
-        assert "Note generation failed" in body
-        assert "status: note-generation-failed" in body
-        assert "retry_meeting_id" in body
-
-        assert engine._last_run_note_failed is True
-        assert engine._last_failed_meeting is not None
+def test_custom_frontmatter_moves_to_transcripts():
+    cfg = zoom_config.ZoomNotesConfig(custom_frontmatter_properties=[{"key": "project", "value": "Platform"}])
+    body = zoom_notes.build_transcript_content("Speech", "Sync", "2026-10-12", cfg, meeting_id="A")
+    assert "project: Platform" in body
+    assert "\nnote:" not in body

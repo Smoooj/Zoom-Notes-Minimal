@@ -7,31 +7,20 @@
 
 import Foundation
 import Combine
-import UserNotifications
 
-/// Snapshot of a meeting whose note generation failed. The transcript was
-/// already saved successfully — this is just the metadata needed to retry
-/// the LLM call without reprocessing the WAL.
+/// Metadata for retrying a failed transcript save.
 struct FailedMeeting: Equatable {
     let meetingId: String
     let title: String
-    let notePath: String?
     let transcriptPath: String?
     let message: String
 }
 
-/// A persisted in-progress accumulator found at engine startup — the
-/// survivor of a prior crash or a previously-failed LLM call. The
-/// transcript itself MAY already be on disk (for confirmed-failed
-/// meetings, transcript_path is populated and the user has the file in
-/// their Notes/Transcripts folder); for crashed-mid-meeting recoveries
-/// it is not. The "recover" command runs the same pipeline as a normal
-/// end-of-meeting finalize: derive title, save transcript if needed,
-/// run LLM, save note.
+/// A captured transcript retained after a crash or failed save.
 struct RecoverableMeeting: Equatable, Identifiable {
     /// Where the snapshot lives on disk, which determines retention:
     ///   .root   — live or just-failed, 24h window
-    ///   .failed — confirmed-failed (LLM error), 30-day window, has sidecar
+    ///   .failed — confirmed-failed (save error), 30-day window, has sidecar
     enum Location: String {
         case root
         case failed
@@ -73,8 +62,8 @@ class AppState: ObservableObject {
     @Published var lastSavedPath: String?
     @Published var lastSavedTranscriptPath: String?
 
-    // Most recent meeting whose note generation failed. Drives the menu bar
-    // "Retry note generation" item. Cleared on successful retry.
+    // Most recent meeting whose transcript saving failed. Drives the menu bar
+    // "Retry transcript saving" item. Cleared on successful retry.
     @Published var lastFailedMeeting: FailedMeeting?
 
     // Meetings whose in-progress accumulator survived a prior crash. Emitted
@@ -183,11 +172,12 @@ class AppState: ObservableObject {
                 lastSavedTitle = title
                 lastSavedPath = event.path
                 lastSavedTranscriptPath = event.transcriptPath
-                sendNoteMadeNotification(title: title, path: event.path)
             }
             // A successful "done" supersedes any prior failure for the same
             // meeting (this is what the retry path emits on success).
-            lastFailedMeeting = nil
+            if event.meetingId == lastFailedMeeting?.meetingId {
+                lastFailedMeeting = nil
+            }
             // And clears it from the recovery list — the user-facing
             // outcome is the same whether the meeting was just recovered
             // from a prior crash or completed normally.
@@ -200,14 +190,13 @@ class AppState: ObservableObject {
             }
         case "cache_cleared":
             recoverableMeetings.removeAll { $0.location == .root }
-        case "note_failed":
+        case "transcript_failed":
             if event.background != true {
                 engineState = .idle
             }
             let failure = FailedMeeting(
                 meetingId: event.meetingId ?? "",
                 title: event.title ?? "Untitled meeting",
-                notePath: event.notePath,
                 transcriptPath: event.transcriptPath,
                 message: event.message ?? "Unknown error"
             )
@@ -216,10 +205,8 @@ class AppState: ObservableObject {
             // "Last saved" item so the user sees something landed on disk.
             if let path = failure.transcriptPath, !path.isEmpty {
                 lastSavedTitle = failure.title
-                lastSavedPath = failure.notePath
                 lastSavedTranscriptPath = path
             }
-            sendNoteFailedNotification(failure: failure)
         case "error":
             engineError = event.message
             engineState = .idle
@@ -256,53 +243,5 @@ class AppState: ObservableObject {
 
     func clearMeetingCache() {
         engineManager.sendCommand(["cmd": "clear_cache"])
-    }
-
-    // MARK: - Notifications
-
-    private func sendNoteMadeNotification(title: String, path: String?) {
-        let content = UNMutableNotificationContent()
-        content.title = "Meeting Notes Saved"
-        content.body = title
-        content.sound = .default
-        content.categoryIdentifier = "MEETING_SAVED"
-        if let path {
-            content.userInfo = ["notePath": path]
-        }
-        let request = UNNotificationRequest(
-            identifier: "zoom-notes-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                log("[Notifications] failed to post note-saved alert: \(error.localizedDescription)",
-                    level: .error)
-            }
-        }
-    }
-
-    private func sendNoteFailedNotification(failure: FailedMeeting) {
-        let content = UNMutableNotificationContent()
-        content.title = "Note Generation Failed"
-        content.body = "\(failure.title) — transcript saved. \(failure.message)"
-        content.sound = .default
-        content.categoryIdentifier = "NOTE_FAILED"
-        content.userInfo = [
-            "meetingId": failure.meetingId,
-            "transcriptPath": failure.transcriptPath ?? "",
-            "notePath": failure.notePath ?? "",
-        ]
-        let request = UNNotificationRequest(
-            identifier: "zoom-notes-failed-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                log("[Notifications] failed to post note-failed alert: \(error.localizedDescription)",
-                    level: .error)
-            }
-        }
     }
 }

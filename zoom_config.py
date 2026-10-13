@@ -1,93 +1,34 @@
 #!/usr/bin/env python3
-"""
-zoom_config.py — Configuration management for Zoom Notes.
+"""Configuration for local transcript capture and saving.
 
-All user-configurable settings live here. Settings are split into two stores:
-  - Non-sensitive prefs: ~/Library/Application Support/zoom-notes/settings.json
-  - API keys:           macOS Keychain (service "zoom-notes-assistant")
-
-Environment variables and .env file are checked as fallback/override, so
-existing launchd plists with ANTHROPIC_API_KEY baked in continue to work.
+Preferences are stored in ~/Library/Application Support/zoom-notes/settings.json.
 """
 
 import json
 import os
-import subprocess
-import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
-
-# ── Default system prompt ──────────────────────────────────────────────────────
-
-DEFAULT_SYSTEM_PROMPT = """You are a meticulous meeting notetaker. Produce detailed, well-structured meeting notes from the transcript. Be thorough — a reader who wasn't in the meeting should come away with a complete picture of what was discussed, decided, and committed to.
-
-Use this structure exactly. Include every section even if brief.
-
-## Overview
-2-4 sentences capturing the purpose and outcome of the meeting. Who was involved, what was the core focus, what was resolved or left open.
-
-## Attendees
-Bullet list of attendee names (use the speaker names from the transcript).
-
-## Topics Discussed
-A sequenced list of the main topics covered. For each topic, 1-3 sentences on what was said — include specific details, numbers, names, and context. Don't collapse important nuance into vague summaries.
-
-Format:
-- **[Topic name]** — [What was discussed. Be specific.]
-
-## Key Decisions
-Decisions that were explicitly made or agreed upon. If none, write "No explicit decisions recorded."
-
-Format:
-- [Decision] — [Who made it or who it affects, if clear]
-
-## Action Items
-A table of all commitments, tasks, and follow-ups. Include owner, task description, and due date if mentioned.
-
-| Owner | Task | Due Date |
-|-------|------|----------|
-| [name] | [what they committed to] | [date or null] |
-
-## Open Questions
-Unresolved questions, decisions deferred, or topics that need follow-up. Omit this section entirely if none.
-
-## Notes
-Any additional context, background, or detail worth capturing that didn't fit above. Omit if nothing relevant.
-
----
-
-Output only the meeting notes. No preamble, no explanation, no meta-commentary."""
 
 # ── Config file path ───────────────────────────────────────────────────────────
 
 _CONFIG_DIR = Path.home() / "Library/Application Support/zoom-notes"
 _CONFIG_FILE = _CONFIG_DIR / "settings.json"
-_KEYCHAIN_SERVICE = "zoom-notes-assistant"
 
 
 # ── Dataclass ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class ZoomNotesConfig:
-    # LLM provider and model
-    llm_provider: str = "claude"          # "claude" | "openai" | "gemini" | "ollama"
-    llm_model: str = "claude-sonnet-5"
-
     # Output paths
-    notes_dir: str = str(Path.home() / "Desktop/Meeting Notes/Notes")
     transcripts_dir: str = str(Path.home() / "Desktop/Meeting Notes/Transcripts")
 
     # Output structure
     subfolder_pattern: str = "day"        # "none" | "day" | "month"
-    filename_pattern: str = "{title}"
     transcript_filename_pattern: str = "{title} \u2014 transcript"
 
-    # Prompt (None = use DEFAULT_SYSTEM_PROMPT)
-    system_prompt: str | None = None
-
     # Frontmatter customization
-    # List of {"key": "...", "value": "..."} dicts — appended to every note's frontmatter.
+    # List of {"key": "...", "value": "..."} dicts — appended to every transcript's frontmatter.
     # Values support {title} and {date} tokens.
     custom_frontmatter_properties: list = None  # type: ignore[assignment]
     # Raw YAML string appended after structured properties (advanced).
@@ -109,7 +50,7 @@ class ZoomNotesConfig:
     # Meeting IDs to permanently ignore. If a detected meeting_id is in
     # this list the engine will not transition to ACTIVE for that meeting.
     # IDs are base64 strings copied from the `meeting_id:` frontmatter
-    # field in any generated note.
+    # field in any saved transcript.
     blocked_meeting_ids: list = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -117,19 +58,6 @@ class ZoomNotesConfig:
             self.custom_frontmatter_properties = []
         if self.blocked_meeting_ids is None:
             self.blocked_meeting_ids = []
-
-    # Provider base URLs (override to route through a proxy)
-    ollama_base_url: str = "http://localhost:11434"
-    openai_base_url: str = "https://api.openai.com/v1/chat/completions"
-    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
-
-    @property
-    def effective_system_prompt(self) -> str:
-        return self.system_prompt or DEFAULT_SYSTEM_PROMPT
-
-    @property
-    def notes_path(self) -> Path:
-        return Path(self.notes_dir).expanduser()
 
     @property
     def transcripts_path(self) -> Path:
@@ -148,116 +76,6 @@ def _config_to_dict(cfg: ZoomNotesConfig) -> dict:
 def _config_from_dict(d: dict) -> ZoomNotesConfig:
     filtered = {k: v for k, v in d.items() if k in _KNOWN_KEYS}
     return ZoomNotesConfig(**filtered)
-
-
-# ── Keychain helpers ───────────────────────────────────────────────────────────
-
-_KEY_ACCOUNTS = {
-    "claude":  "anthropic_api_key",
-    "openai":  "openai_api_key",
-    "gemini":  "gemini_api_key",
-}
-
-# Env var fallbacks per provider (existing behaviour preserved)
-_KEY_ENV_VARS = {
-    "claude":  "ANTHROPIC_API_KEY",
-    "openai":  "OPENAI_API_KEY",
-    "gemini":  "GEMINI_API_KEY",
-}
-
-
-_SECURITY_BIN = "/usr/bin/security"
-
-
-def keychain_get(account: str) -> str | None:
-    """Read a password from the macOS Keychain. Returns None if not found."""
-    try:
-        result = subprocess.run(
-            [
-                _SECURITY_BIN, "find-generic-password",
-                "-s", _KEYCHAIN_SERVICE,
-                "-a", account,
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            value = result.stdout.strip()
-            return value if value else None
-    except OSError:
-        pass
-    return None
-
-
-def keychain_set(account: str, value: str) -> bool:
-    """Write (or update) a password in the macOS Keychain. Returns True on success."""
-    if not value:
-        return keychain_delete(account)
-    try:
-        result = subprocess.run(
-            [
-                _SECURITY_BIN, "add-generic-password",
-                "-s", _KEYCHAIN_SERVICE,
-                "-a", account,
-                "-w", value,
-                "-U",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except OSError:
-        return False
-
-
-def keychain_delete(account: str) -> bool:
-    """Delete a Keychain entry. Returns True if deleted or already absent."""
-    try:
-        result = subprocess.run(
-            [
-                _SECURITY_BIN, "delete-generic-password",
-                "-s", _KEYCHAIN_SERVICE,
-                "-a", account,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode in (0, 44)  # 44 = not found, which is fine
-    except OSError:
-        return False
-
-
-def get_api_key(provider: str) -> str | None:
-    """
-    Return the API key for the given provider.
-    Priority: env var (injected by Swift at launch) → Keychain CLI fallback.
-    Checking env first avoids calling the `security` binary, which triggers
-    repeated macOS keychain permission prompts when run from a subprocess.
-    """
-    # Env var first — Swift EngineManager injects these from Keychain at launch
-    env_var = _KEY_ENV_VARS.get(provider)
-    if env_var:
-        val = os.environ.get(env_var)
-        if val:
-            return val
-
-    # Keychain CLI fallback (covers standalone / dev usage without Swift host)
-    account = _KEY_ACCOUNTS.get(provider)
-    if account:
-        key = keychain_get(account)
-        if key:
-            return key
-
-    return None
-
-
-def set_api_key(provider: str, value: str) -> bool:
-    """Store the API key for the given provider in the Keychain."""
-    account = _KEY_ACCOUNTS.get(provider)
-    if not account:
-        return False
-    return keychain_set(account, value)
 
 
 # ── Load / save ────────────────────────────────────────────────────────────────
@@ -285,10 +103,6 @@ def load_config(force: bool = False) -> ZoomNotesConfig:
 
     # Env var overrides for paths (preserves ZOOM_NOTES_OUTPUT_DIR / ZOOM_NOTES_TRANSCRIPTS_DIR
     # for users who launch the engine from a CLI/launchd plist with these set).
-    # ZOOM_NOTES_API_URL is read directly by zoom_notes.summarize_with_claude;
-    # we don't need to copy it onto the config here.
-    if val := os.environ.get("ZOOM_NOTES_OUTPUT_DIR"):
-        cfg.notes_dir = val
     if val := os.environ.get("ZOOM_NOTES_TRANSCRIPTS_DIR"):
         cfg.transcripts_dir = val
 
@@ -341,33 +155,12 @@ def resolve_filename(pattern: str, title: str, date_str: str) -> str:
     return pattern.replace("{title}", title).replace("{date}", date_str)
 
 
-# ── CLI helper (for debugging) ────────────────────────────────────────────────
+# ── CLI helper ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="zoom_config — view/edit settings")
+    parser = argparse.ArgumentParser(description="zoom_config — view transcript settings")
     parser.add_argument("--show", action="store_true", help="Print current config")
-    parser.add_argument("--set-key", metavar="PROVIDER", help="Store API key for provider (reads from stdin)")
     args = parser.parse_args()
-
     if args.show:
-        cfg = get_config()
-        print(json.dumps(_config_to_dict(cfg), indent=2))
-        for provider in _KEY_ACCOUNTS:
-            key = get_api_key(provider)
-            masked = f"{key[:8]}…" if key and len(key) > 8 else ("(set)" if key else "(not set)")
-            print(f"  {provider} key: {masked}")
-    elif args.set_key:
-        provider = args.set_key.lower()
-        if provider not in _KEY_ACCOUNTS:
-            print(f"Unknown provider: {provider}. Choose from: {', '.join(_KEY_ACCOUNTS)}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Enter {provider} API key (input hidden): ", end="", flush=True)
-        import getpass
-        value = getpass.getpass("")
-        if set_api_key(provider, value):
-            print("Key saved to Keychain.")
-        else:
-            print("Failed to save key.", file=sys.stderr)
-            sys.exit(1)
+        print(json.dumps(_config_to_dict(get_config()), indent=2))

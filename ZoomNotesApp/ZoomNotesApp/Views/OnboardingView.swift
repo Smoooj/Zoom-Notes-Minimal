@@ -31,7 +31,7 @@ struct OnboardingView: View {
                     .font(.largeTitle)
                     .fontWeight(.semibold)
 
-                Text("Automatic meeting notes, delivered to your Desktop.")
+                Text("Automatic meeting transcripts, saved on your Mac.")
                     .font(.title3)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -50,13 +50,13 @@ struct OnboardingView: View {
                 OnboardingStep(
                     number: "2",
                     title: "Reads your Zoom transcript",
-                    detail: "When your meeting ends, it detects the transcript Zoom saves locally on your Mac and sends it to your chosen AI to summarize.",
+                    detail: "It reads the transcript captured by Zoom My Notes and preserves it as a local Markdown file.",
                     icon: "text.bubble"
                 )
                 OnboardingStep(
                     number: "3",
-                    title: "Saves notes to your Desktop",
-                    detail: "Structured meeting notes appear in ~/Desktop/Meeting Notes/ automatically. You can change the location and format in Settings.",
+                    title: "Saves transcripts to your Desktop",
+                    detail: "Transcripts appear in ~/Desktop/Meeting Notes/Transcripts/ automatically. You can change the folder and filenames in Settings.",
                     icon: "square.and.arrow.down"
                 )
             }
@@ -68,7 +68,7 @@ struct OnboardingView: View {
                 Image(systemName: "lock.shield")
                     .foregroundColor(.secondary)
                     .font(.caption)
-                Text("Transcripts are sent to your configured AI provider. Use Ollama in Settings for fully local, private processing.")
+                Text("Zoom Notes saves transcripts locally and does not send them to any other service.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }

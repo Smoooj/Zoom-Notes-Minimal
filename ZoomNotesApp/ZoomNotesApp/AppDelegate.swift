@@ -8,16 +8,15 @@
 //  States map to menu bar icon:
 //    idle       → doc.plaintext (grey, template)
 //    active     → doc.plaintext (blue accent)
-//    generating → gear (spinning-ish — static icon with tint)
+//    saving → gear (spinning-ish — static icon with tint)
 //
 
 import Cocoa
 import SwiftUI
 import Combine
-import UserNotifications
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency UNUserNotificationCenterDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusBarItem: NSStatusItem?
     var settingsWindow: NSWindow?
     var onboardingWindow: NSWindow?
@@ -25,12 +24,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     let appState = AppState()
     private var cancellables = Set<AnyCancellable>()
     private var menuUpdateTimer: Timer?
-
-    /// True when macOS will not display our alerts — either the app is not
-    /// authorized or alerts are switched off for it. Drives the menu warning.
-    private var notificationsBlocked = false
-    private var menuTickCount = 0
-    private var didCheckNotifications = false
 
     // MARK: - Launch
 
@@ -41,8 +34,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         log("ZoomNotesApp launched", level: .info)
         log("Log file: \(ConsoleLogger.shared.getCurrentLogPath())", level: .info)
 
-        requestNotificationPermission()
-        CalendarService.shared.start()
         setupMenuBar()
         observeAppState()
         showOnboardingIfNeeded()
@@ -53,10 +44,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             Task { @MainActor in
                 guard let self else { return }
                 self.updateMenuBar()
-                self.menuTickCount += 1
-                if self.menuTickCount % 15 == 0 {
-                    self.refreshNotificationAuthorization()
-                }
             }
         }
     }
@@ -72,140 +59,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         return false
     }
 
-    // MARK: - Notification permission
-
-    private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().delegate = self
-
-        let openAction = UNNotificationAction(identifier: "OPEN_IN_FINDER", title: "Show in Finder")
-        let savedCategory = UNNotificationCategory(
-            identifier: "MEETING_SAVED",
-            actions: [openAction],
-            intentIdentifiers: []
-        )
-
-        let retryAction = UNNotificationAction(
-            identifier: "RETRY_NOTE_GEN",
-            title: "Retry",
-            options: [.foreground]
-        )
-        let showTranscriptAction = UNNotificationAction(
-            identifier: "SHOW_TRANSCRIPT",
-            title: "Show transcript"
-        )
-        let failedCategory = UNNotificationCategory(
-            identifier: "NOTE_FAILED",
-            actions: [retryAction, showTranscriptAction],
-            intentIdentifiers: []
-        )
-
-        UNUserNotificationCenter.current().setNotificationCategories([savedCategory, failedCategory])
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
-            if let error {
-                log("[Notifications] requestAuthorization failed: \(error.localizedDescription)", level: .error)
-            } else {
-                log("[Notifications] requestAuthorization granted=\(granted)", level: .info)
-            }
-            // requestAuthorization returning true is not sufficient — macOS can
-            // still have the app's alerts turned off (or, when several bundles
-            // claim the same identifier, no record for it at all). Read back
-            // what Notification Center actually has and surface a mismatch.
-            self.refreshNotificationAuthorization()
-        }
-    }
-
-    /// Read the live notification settings and cache them for the menu bar.
-    /// Called at launch and whenever the menu is rebuilt, so a permission the
-    /// user revokes (or that macOS drops on a re-signed build) becomes visible
-    /// instead of silently swallowing every alert.
-    func refreshNotificationAuthorization() {
-        UNUserNotificationCenter.current().getNotificationSettings { settings in
-            let status = settings.authorizationStatus
-            let alerts = settings.alertSetting
-            Task { @MainActor in
-                let wasBlocked = self.notificationsBlocked
-                let firstCheck = !self.didCheckNotifications
-                self.didCheckNotifications = true
-                self.notificationsBlocked = (status != .authorized && status != .provisional)
-                    || alerts == .disabled
-                // Always log the first readback so a healthy launch is on the
-                // record too — otherwise silence is ambiguous between "fine"
-                // and "never ran".
-                if firstCheck || self.notificationsBlocked != wasBlocked || self.notificationsBlocked {
-                    log(
-                        """
-                        [Notifications] authorizationStatus=\(status.rawValue) \
-                        alertSetting=\(alerts.rawValue) blocked=\(self.notificationsBlocked)
-                        """,
-                        level: self.notificationsBlocked ? .error : .info
-                    )
-                }
-            }
-        }
-    }
-
-    /// Post a throwaway alert so the user can confirm notifications actually
-    /// reach the screen. Silent failures here are the whole reason this exists:
-    /// the app can be authorized and still have nothing appear.
-    @objc func sendTestNotification() {
-        ConsoleLogger.shared.logUserAction("Send test notification")
-        refreshNotificationAuthorization()
-
-        let content = UNMutableNotificationContent()
-        content.title = "Zoom Notes"
-        content.body = "Test notification — alerts are working."
-        content.sound = .default
-        let request = UNNotificationRequest(
-            identifier: "zoom-notes-test-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                log("[Notifications] test alert failed: \(error.localizedDescription)", level: .error)
-            } else {
-                log("[Notifications] test alert posted", level: .info)
-            }
-        }
-    }
-
-    @objc func openNotificationSettings() {
-        ConsoleLogger.shared.logUserAction("Open notification settings")
-        Permissions.openNotificationSettings()
-    }
-
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {
-        let userInfo = response.notification.request.content.userInfo
-        switch response.actionIdentifier {
-        case "OPEN_IN_FINDER", UNNotificationDefaultActionIdentifier:
-            if let path = userInfo["notePath"] as? String, !path.isEmpty {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-            } else if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-            }
-        case "RETRY_NOTE_GEN":
-            ConsoleLogger.shared.logUserAction("Retry note generation (from notification)")
-            Task { @MainActor in self.appState.retryFailedMeeting() }
-        case "SHOW_TRANSCRIPT":
-            if let path = userInfo["transcriptPath"] as? String, !path.isEmpty {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-            }
-        default:
-            break
-        }
-        completionHandler()
-    }
-
     // MARK: - Menu bar setup
 
     func setupMenuBar() {
-        statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         guard let button = statusBarItem?.button else { return }
         button.image = menuBarIcon()
+        button.title = ""
+        button.imagePosition = .imageOnly
         button.toolTip = "Zoom Notes"
         updateMenuBar()
     }
@@ -242,92 +103,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         return img
     }
 
-    /// Truncates a calendar event title so long meeting names don't blow up
-    /// the menu bar width or the dropdown menu's layout. Cuts at a character
-    /// boundary and appends an ellipsis rather than wrapping or clipping.
-    private func truncatedEventTitle(_ title: String, maxLength: Int) -> String {
-        guard title.count > maxLength else { return title }
-        let cutoff = title.index(title.startIndex, offsetBy: maxLength)
-        return title[..<cutoff].trimmingCharacters(in: .whitespaces) + "…"
-    }
-
     func updateMenuBar() {
         let menu = NSMenu()
         let state = appState.engineState
-        let upcoming = CalendarService.shared.upcomingEvents(withinHours: 4)
-        let nextMeeting = upcoming.first
 
         // ── Status header ────────────────────────────────────────────────────
         let statusTitle: String
         switch state {
-        case .idle:
-            if let next = nextMeeting {
-                let title = truncatedEventTitle(next.title, maxLength: 40)
-                statusTitle = next.isNow
-                    ? "\(title) — Now"
-                    : "\(title) — \(next.startTimeString) (\(next.timeLabel))"
-            } else {
-                statusTitle = "Idle — waiting for meeting"
-            }
+        case .idle:       statusTitle = "Idle — waiting for meeting"
         case .active:     statusTitle = "Meeting in progress…"
-        case .generating: statusTitle = "Generating notes…"
+        case .saving: statusTitle = "Saving transcript…"
         case .unknown:    statusTitle = "Engine starting…"
         }
         let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
         statusItem.isEnabled = false
         menu.addItem(statusItem)
 
-        // ── Upcoming meetings ────────────────────────────────────────────────
-        if !upcoming.isEmpty {
-            menu.addItem(.separator())
-
-            // Show up to 4 events; bold/highlight the one happening now
-            for event in upcoming.prefix(4) {
-                let title = truncatedEventTitle(event.title, maxLength: 40)
-                let label = event.isNow
-                    ? "\(title) — Now"
-                    : "\(title) — \(event.startTimeString) (\(event.timeLabel))"
-                let item = NSMenuItem(title: label, action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                if event.isNow {
-                    item.attributedTitle = NSAttributedString(
-                        string: label,
-                        attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)]
-                    )
-                }
-                menu.addItem(item)
-            }
-
-            // Join shortcut — first upcoming event with a Zoom URL
-            if let joinable = upcoming.first(where: { $0.zoomUrl != nil }),
-               let urlStr = joinable.zoomUrl {
-                menu.addItem(.separator())
-                let joinItem = NSMenuItem(
-                    title: "Join: \(truncatedEventTitle(joinable.title, maxLength: 40))",
-                    action: #selector(joinMeeting(_:)),
-                    keyEquivalent: ""
-                )
-                joinItem.representedObject = urlStr
-                joinItem.target = self
-                menu.addItem(joinItem)
-            }
-
-            let refreshItem = NSMenuItem(
-                title: "Refresh Calendar",
-                action: #selector(refreshCalendar),
-                keyEquivalent: ""
-            )
-            refreshItem.target = self
-            menu.addItem(refreshItem)
-        }
-
         menu.addItem(.separator())
 
-        // Last saved note
+        // Last saved transcript
         if let title = appState.lastSavedTitle, !title.isEmpty {
             let lastItem = NSMenuItem(
                 title: "Last saved: \(title)",
-                action: #selector(openLastNoteInFinder),
+                action: #selector(openLastTranscriptInFinder),
                 keyEquivalent: ""
             )
             lastItem.target = self
@@ -336,7 +134,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         }
 
         // Recoverable meetings — in-progress accumulators left on disk by a
-        // prior crashed engine session OR by a previous LLM failure that's
+        // prior crashed engine session OR by a previous save failure that's
         // still inside its 30-day failed/ retention window. Single recovery
         // shows inline; two or more collapse into a submenu.
         if !appState.recoverableMeetings.isEmpty {
@@ -416,11 +214,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
-        // Retry note generation if a failed meeting is queued. The transcript
-        // is already on disk; this just re-runs the LLM call.
+        // Retry a local file write from the retained capture snapshot.
         if let failure = appState.lastFailedMeeting {
             let retryItem = NSMenuItem(
-                title: "Retry note generation: \(failure.title)",
+                title: "Retry transcript saving: \(failure.title)",
                 action: #selector(retryFailed),
                 keyEquivalent: "r"
             )
@@ -451,8 +248,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         // Manual trigger when active
         if state == .active {
             let genItem = NSMenuItem(
-                title: "Generate Notes Now",
-                action: #selector(generateNow),
+                title: "Save Transcript Now",
+                action: #selector(saveNow),
                 keyEquivalent: "g"
             )
             genItem.keyEquivalentModifierMask = .command
@@ -461,21 +258,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             menu.addItem(.separator())
         }
 
-        if notificationsBlocked {
-            let warn = NSMenuItem(
-                title: "⚠ Notifications are off — fix in System Settings",
-                action: #selector(openNotificationSettings),
-                keyEquivalent: ""
-            )
-            menu.addItem(warn)
-            menu.addItem(.separator())
-        }
-
-        // Error display — show errors that are actionable; suppress transient/auth noise
-        if let err = appState.engineError,
-           !err.contains("401"),
-           !err.contains("API key"),
-           !err.contains("quota exceeded") {
+        if let err = appState.engineError {
             let errItem = NSMenuItem(title: "⚠ \(err)", action: nil, keyEquivalent: "")
             errItem.isEnabled = false
             menu.addItem(errItem)
@@ -484,11 +267,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Open Logs…", action: #selector(openLogs), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(
-            title: "Send Test Notification",
-            action: #selector(sendTestNotification),
-            keyEquivalent: ""
-        ))
         menu.addItem(NSMenuItem(title: "Clear Meeting Cache", action: #selector(clearCache), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Zoom Notes", action: #selector(quitApp), keyEquivalent: "q"))
@@ -496,48 +274,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         menu.items.forEach { $0.target = self }
         statusBarItem?.menu = menu
 
-        // Update status bar button — show next meeting name + countdown when idle
+        // The status item always contains only its icon.
         if let button = statusBarItem?.button {
             button.image = menuBarIcon()
+            button.title = ""
+            button.imagePosition = .imageOnly
             switch state {
             case .idle, .unknown:
                 button.contentTintColor = nil
-                if let next = nextMeeting, state == .idle {
-                    let title = truncatedEventTitle(next.title, maxLength: 24)
-                    let label = next.isNow ? "\(title) — Now" : "\(title) · \(next.timeLabel)"
-                    button.title = "  \(label)"
-                    button.imagePosition = .imageLeft
-                    button.toolTip = next.isNow ? "Zoom Notes — \(next.title)" : "Zoom Notes — Next: \(next.title)"
-                } else {
-                    button.title = ""
-                    button.imagePosition = .imageOnly
-                    button.toolTip = appState.isEngineRunning ? "Zoom Notes — Idle" : "Zoom Notes — Engine starting…"
-                }
+                button.toolTip = appState.isEngineRunning ? "Zoom Notes — Idle" : "Zoom Notes — Engine starting…"
             case .active:
-                button.title = ""
-                button.imagePosition = .imageOnly
                 button.contentTintColor = .controlAccentColor
                 button.toolTip = "Zoom Notes — Meeting in progress"
-            case .generating:
-                button.title = ""
-                button.imagePosition = .imageOnly
+            case .saving:
                 button.contentTintColor = .systemOrange
-                button.toolTip = "Zoom Notes — Generating notes…"
+                button.toolTip = "Zoom Notes — Saving transcript…"
             }
         }
     }
 
-
     // MARK: - Menu actions
 
-    @objc func generateNow() {
-        ConsoleLogger.shared.logUserAction("Generate Notes Now")
-        appState.engineManager.sendCommand(["cmd": "generate"])
-    }
-
-    @objc func openLastNoteInFinder() {
-        guard let path = appState.lastSavedPath, !path.isEmpty else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    @objc func saveNow() {
+        ConsoleLogger.shared.logUserAction("Save Transcript Now")
+        appState.engineManager.sendCommand(["cmd": "save"])
     }
 
     @objc func openLastTranscriptInFinder() {
@@ -548,7 +308,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     }
 
     @objc func retryFailed() {
-        ConsoleLogger.shared.logUserAction("Retry note generation")
+        ConsoleLogger.shared.logUserAction("Retry transcript saving")
         appState.retryFailedMeeting()
     }
 
@@ -599,7 +359,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
     /// Optional subtitle line shown beneath the recover item when there's
     /// only one recoverable meeting. For failed bucket entries we surface
-    /// the LLM error so the user knows what to fix before retrying.
+    /// the save error so the user knows what to fix before retrying.
     private func recoverableSubtitleDetail(for rec: RecoverableMeeting) -> String {
         switch rec.location {
         case .failed:
@@ -668,22 +428,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         ConsoleLogger.shared.openTodayLogDirectory()
     }
 
-    @objc func joinMeeting(_ sender: NSMenuItem) {
-        guard let urlStr = sender.representedObject as? String,
-              let url = URL(string: urlStr) else { return }
-        ConsoleLogger.shared.logUserAction("Join meeting from calendar")
-        NSWorkspace.shared.open(url)
-    }
-
-    @objc func refreshCalendar() {
-        ConsoleLogger.shared.logUserAction("Refresh Calendar")
-        CalendarService.shared.refresh()
-        // Trigger a menu rebuild after a short delay to show updated events
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.updateMenuBar()
-        }
-    }
-
     @objc func quitApp() {
         NSApplication.shared.terminate(nil)
     }
@@ -730,42 +474,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         onboardingWindow?.close()
         onboardingWindow = nil
         NSApp.setActivationPolicy(.accessory)
-    }
-
-    // MARK: - Privacy disclaimer
-
-    private static let privacyDisclaimerKey = "hasSeenPrivacyDisclaimer.v1"
-
-    private func showPrivacyDisclaimerIfNeeded() {
-        let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: Self.privacyDisclaimerKey) else { return }
-
-        let alert = NSAlert()
-        alert.messageText = "Heads up: transcripts are sent to your LLM provider"
-        alert.informativeText = """
-        Zoom Notes generates meeting summaries by sending the full transcript \
-        of each meeting to whichever LLM provider you configure (Claude, OpenAI, \
-        or Gemini by default). Anything spoken in the meeting — including \
-        sensitive or confidential content — is included.
-
-        If you need local-only processing, choose Ollama in Settings → API / LLM. \
-        Ollama runs entirely on your Mac and never sends data to a third party.
-        """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Got it")
-        alert.addButton(withTitle: "Open Settings")
-
-        // Make sure the alert is visible by briefly going active.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        NSApp.setActivationPolicy(.accessory)
-
-        defaults.set(true, forKey: Self.privacyDisclaimerKey)
-
-        if response == .alertSecondButtonReturn {
-            showSettings()
-        }
     }
 
     // MARK: - NSWindowDelegate

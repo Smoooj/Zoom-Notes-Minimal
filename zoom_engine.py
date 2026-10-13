@@ -6,22 +6,22 @@ Replaces zoom_menu_bar.py. No rumps, no UI — designed to run as a child proces
 of the Swift ZoomNotesApp. Emits newline-delimited JSON events to stdout and
 accepts JSON commands on stdin (for future extensibility).
 
-State machine: idle → active → generating → idle
+State machine: idle → active → saving → idle
 
 JSON events emitted to stdout:
   {"event": "state", "value": "idle"}
   {"event": "state", "value": "active", "meeting_id": "<id>"}
-  {"event": "state", "value": "generating"}
+  {"event": "state", "value": "saving"}
   {"event": "done", "title": "...", "path": "...", "transcript_path": "...", "attendees": [...], "meeting_id": "..."}
-  {"event": "done", ..., "background": true}   — abandoned-meeting generation; main loop is still ACTIVE, don't reset UI state
-  {"event": "note_failed", ..., "background": true}  — same, but the LLM call failed
+  {"event": "done", ..., "background": true}   — abandoned-meeting saving; main loop is still ACTIVE, don't reset UI state
+  {"event": "transcript_failed", ..., "background": true}  — same, but the transcript save failed
   {"event": "recovery_available", "meeting_id": "...", "entry_count": N, "last_updated": "...", "slug_hint": "...", "location": "root|failed", "title": "...?", "failed_at": "...?", "last_error": "...?"}
   {"event": "error", "message": "..."}
 
 stdin commands accepted (one JSON object per line):
-  {"cmd": "generate"}                       — manual trigger
+  {"cmd": "save"}                       — manual trigger
   {"cmd": "reload"}                         — reload settings (also triggered by SIGHUP)
-  {"cmd": "retry", "meeting_id": "..."}     — retry a meeting whose LLM call just failed
+  {"cmd": "retry", "meeting_id": "..."}     — retry a meeting whose transcript save failed
   {"cmd": "recover", "meeting_id": "..."}   — recover a meeting from a prior crash
 """
 
@@ -39,16 +39,6 @@ from pathlib import Path
 def _friendly_error(exc: Exception) -> str:
     """Convert a raw exception into a short, human-readable menu bar message."""
     msg = str(exc)
-    # HTTP status codes from LLM providers
-    for code, label in [
-        ("429", "LLM quota exceeded — try again later"),
-        ("401", "LLM authentication failed — check your API key in Settings"),
-        ("403", "LLM access denied — check your API key in Settings"),
-        ("500", "LLM server error — try again later"),
-        ("503", "LLM service unavailable — try again later"),
-    ]:
-        if code in msg:
-            return label
     # Truncate anything else to a reasonable length
     first_line = msg.splitlines()[0] if msg else "Unknown error"
     return first_line[:80] + ("…" if len(first_line) > 80 else "")
@@ -57,9 +47,6 @@ def _friendly_error(exc: Exception) -> str:
 from zoom_config import (
     get_config,
     invalidate_config_cache,
-    get_api_key,
-    resolve_subfolder,
-    resolve_filename,
 )
 from zoom_notes import (
     CancelledError,
@@ -67,16 +54,9 @@ from zoom_notes import (
     find_wal,
     parse_transcript,
     parse_meeting_title,
-    read_calendar_title,
     format_transcript,
-    summarize,
-    generate_title,
-    build_note_content,
-    build_placeholder_note,
     build_transcript_content,
     save_transcript_only,
-    save_note_only,
-    overwrite_note,
     slugify_title,
     detect_active_meeting_id,
     persist_accumulator,
@@ -87,8 +67,6 @@ from zoom_notes import (
     purge_stale_accumulators,
     list_recoverable_meetings,
     mark_meeting_failed,
-    _path_to_vault_link,
-    _atomic_write_text,
     _CACHE_DIR,
     _safe_meeting_id_slug,
 )
@@ -111,14 +89,11 @@ def emit(payload: dict) -> None:
 class EngineState:
     IDLE = "idle"
     ACTIVE = "active"
-    GENERATING = "generating"
+    SAVING = "saving"
 
 
-# Hard ceiling for one note-generation pass (parse + LLM + write).
-# urllib's per-call timeout is 180s and _http_retry sleeps 15+30+60 between
-# attempts, so the worst-case for one summarize() call is ~13 minutes. We cap
-# the whole pipeline at 5 minutes — anything longer is almost certainly stuck.
-_GENERATE_TIMEOUT_SECS = 5 * 60
+# Bound a transcript save so a stalled filesystem cannot stop capture indefinitely.
+_SAVE_TIMEOUT_SECS = 60
 
 # Force a fresh on-disk snapshot every N ACTIVE ticks regardless of whether
 # the in-memory accumulator changed. Belt-and-suspenders against a SQLite WAL
@@ -153,7 +128,7 @@ class ZoomEngine:
     def __init__(self):
         self._state = EngineState.IDLE
         self._state_lock = threading.Lock()
-        self._generating_lock = threading.Lock()
+        self._saving_lock = threading.Lock()
 
         # All WAL-tracking variables share a single lock. Read and write only
         # via the helpers below; never touch the underscored fields directly
@@ -167,26 +142,26 @@ class ZoomEngine:
         # (the IDLE→ACTIVE transition tick). Combined with `_active_meeting_id`
         # it forms a session fingerprint that distinguishes recurring Zoom
         # meetings (same meeting_id, different start time) from a checkpoint
-        # mutation of the same meeting we just generated for.
+        # mutation of the same meeting we just saved for.
         self._active_session_mtime: float | None = None
 
-        # Fingerprint of the last successfully-generated meeting session.
+        # Fingerprint of the last successfully-saved meeting session.
         # Tuple of (meeting_id, session_start_mtime). Guards against:
         #   1. Zoom's post-meeting WAL checkpoint replaying the same meeting.
         #   2. False suppression of recurring meetings that reuse the same
         #      Zoom meeting_id — a new IDLE→ACTIVE produces a different
         #      session_start_mtime so the guard correctly lets it through.
-        self._last_generated_session: tuple[str, float] | None = None
+        self._last_saved_session: tuple[str, float] | None = None
 
         # `(meeting_id, latest_ts_secs)` for the session we most recently
-        # generated notes for, where `latest_ts_secs` is the wall-clock
+        # saved transcripts for, where `latest_ts_secs` is the wall-clock
         # seconds-since-midnight of the last transcript entry we wrote.
         # Passed to `detect_active_meeting_id` on the next IDLE -> ACTIVE
         # transition so the just-completed meeting can't trap detection
         # while its data is still resident in the WAL (the 2026-04-30
         # back-to-back-meeting overwrite scenario). Distinct from
-        # `_last_generated_session`: the fingerprint there guards against
-        # re-summarizing the same checkpoint, this guards against picking
+        # `_last_saved_session`: the fingerprint there guards against
+        # re-saving the same checkpoint, this guards against picking
         # up the wrong meeting when a NEW one starts immediately after.
         # Shape: (meeting_id, freshness_floor_secs, set_at_epoch). The third
         # element stamps when the boundary was recorded so `_active_boundary`
@@ -196,25 +171,19 @@ class ZoomEngine:
 
         # Deferred abandoned-meeting note (the 2026-06-30 single-meeting-flap
         # fix). When a mid-ACTIVE meeting_id change abandons a real-looking
-        # accumulator, we no longer generate its note immediately — a single
+        # accumulator, we no longer save its transcript immediately — a single
         # meeting whose ID oscillates between two values would otherwise fire
         # a premature note on every score flip. Instead we hold the abandoned
-        # snapshot here and only generate once the meeting we switched TO
+        # snapshot here and only save once the meeting we switched TO
         # proves real (accumulates its own content). A flap swings the score
         # back to this id before that happens, and the flap-back guard in
         # Case B restores it instead. Shape: {"meeting_id": str, "snapshot": dict}.
         self._pending_abandoned: dict | None = None
 
-        # Set by _generate_notes when it writes a placeholder note instead of
-        # a final note. Read by the worker so it knows to keep the persisted
-        # accumulator (for retry) rather than deleting it.
-        self._last_run_note_failed: bool = False
+        # Keep the recovery snapshot if transcript saving fails.
+        self._last_run_save_failed: bool = False
 
-        # Cooperative cancellation signal for in-flight note generation.
-        # Cleared at the start of every _trigger_generate / _trigger_retry
-        # and set when the outer 5-min wall-clock timeout fires (so the
-        # still-running summarize() thread can abort at its next checkpoint
-        # instead of zombie-running until the urllib per-call timeout).
+        # Signal cancellation before a delayed save writes to disk.
         self._cancel_event = threading.Event()
 
         # Most recent failed-note metadata, used to drive a retry without
@@ -228,7 +197,7 @@ class ZoomEngine:
 
         # Monotonic timestamp of when the WAL was last seen while ACTIVE.
         # Set when the WAL disappears mid-meeting (Zoom checkpoint) so we can
-        # fire generation after idle_threshold even without the WAL present.
+        # fire saving after idle_threshold even without the WAL present.
         self._wal_gone_since: float | None = None
 
         # Counter of ACTIVE ticks since the last accumulator persist call. Used
@@ -251,7 +220,7 @@ class ZoomEngine:
         # meetings where Zoom's post-meeting WAL checkpoint writes keep
         # the WAL "alive" (resetting the normal idle clock) even after
         # the last speech was captured — causing the meeting to never
-        # trigger generation until the app is restarted.
+        # trigger saving until the app is restarted.
         self._last_acc_changed_wall_time: float | None = None
 
         # Purge stale in-progress cache files left over from prior crashes.
@@ -306,18 +275,18 @@ class ZoomEngine:
         self._reload_requested = True
 
     def _on_sigterm(self, signum, frame):
-        """SIGTERM: finish any in-flight generation before exiting.
+        """SIGTERM: finish any in-flight saving before exiting.
 
-        Without this, app termination mid-generation kills the background
+        Without this, app termination mid-saving kills the background
         thread before it can call delete_persisted_accumulator(), leaving
         an orphaned snapshot that surfaces as a spurious "recover unfinished
-        meeting" item on the next launch. Cancelling the LLM call and waiting
+        meeting" item on the next launch. Cancelling transcript saving and waiting
         up to 10 seconds gives the worker a clean exit path.
         """
         self._cancel_event.set()
-        acquired = self._generating_lock.acquire(timeout=10)
+        acquired = self._saving_lock.acquire(timeout=10)
         if acquired:
-            self._generating_lock.release()
+            self._saving_lock.release()
         sys.exit(0)
 
     # ── Tracking helpers (always held under _tracking_lock) ─────────────────
@@ -338,7 +307,7 @@ class ZoomEngine:
     def _latest_acc_ts_secs_for(self, meeting_id: str) -> int | None:
         """Latest accumulator timestamp for `meeting_id`, in seconds-since-midnight.
 
-        Used to stamp `_last_completed_boundary` after generation. Returns
+        Used to stamp `_last_completed_boundary` after saving. Returns
         None if the accumulator has no entries for that meeting (we won't
         block detection on a non-existent boundary).
         """
@@ -705,13 +674,13 @@ class ZoomEngine:
                     has_entries = bool(self._accumulated)
                 if has_entries:
                     # WAL disappeared mid-meeting (Zoom checkpoint). Keep ACTIVE
-                    # and fire generation once the idle threshold elapses.
+                    # and fire saving once the idle threshold elapses.
                     if self._wal_gone_since is None:
                         self._wal_gone_since = time.monotonic()
                     idle_secs = time.monotonic() - self._wal_gone_since
                     if idle_secs >= idle_threshold:
                         self._wal_gone_since = None
-                        self._trigger_generate(origin, cfg)
+                        self._trigger_save(origin, cfg)
                     return
                 # No entries yet — WAL gone before we accumulated anything
                 self._wal_gone_since = None
@@ -737,7 +706,7 @@ class ZoomEngine:
         # past meeting. Anchor to the observed values WITHOUT marking it as
         # "changed" — otherwise a stale WAL from a meeting that ended hours
         # ago would immediately flip us to ACTIVE on engine restart and
-        # re-trigger generation 90 seconds later.
+        # re-trigger saving 90 seconds later.
         if last_mtime is None or last_size is None:
             self._write_tracking(mtime=mtime, size=size)
             return
@@ -784,7 +753,7 @@ class ZoomEngine:
         if changed:
             self._write_tracking(active_ts=now)
             # On IDLE -> ACTIVE we ask detection to ignore the meeting we
-            # just finished generating notes for. Without this the still-
+            # just finished saving transcripts for. Without this the still-
             # resident WAL data from that meeting (huge entry count + still
             # within the recency window) outscores the one or two entries
             # the freshly-starting meeting has produced, and tracking locks
@@ -874,7 +843,7 @@ class ZoomEngine:
                             # snapshot is kept for manual recovery but must not
                             # auto-load into a fresh live session.  Loading it would
                             # cause Case-B abandoned-meeting logic to fire with stale
-                            # data and generate notes for the wrong (yesterday's)
+                            # data and save transcripts for the wrong (yesterday's)
                             # meeting instead of the one that just started.
                             slug = _safe_meeting_id_slug(meeting_id)
                             snap_path = _CACHE_DIR / f"in-progress-{slug}.json"
@@ -916,7 +885,7 @@ class ZoomEngine:
                 #     WITHOUT clearing the accumulator — the entries we
                 #     captured during the empty-tracking window are real
                 #     for this same meeting; their `meeting_id` field was
-                #     just None at parse time. The generation-time filter
+                #     just None at parse time. The saving-time filter
                 #     keeps no-id entries alongside matching-id entries.
                 #     This is the 2026-04-30 PM Brand Team Meeting fix.
                 #
@@ -932,7 +901,7 @@ class ZoomEngine:
                     with self._accumulated_lock:
                         # Stamp the late-arriving meeting_id onto any entries
                         # that lacked one so they survive the strict filter
-                        # at generation time even if anything later changes
+                        # at saving time even if anything later changes
                         # the inclusion rules.
                         for entry in self._accumulated.values():
                             if not entry.get("meeting_id"):
@@ -970,7 +939,7 @@ class ZoomEngine:
                         # back to it — proof that this is a SINGLE meeting whose
                         # ID oscillates between two values, not a back-to-back
                         # boundary. Restore it and discard the phantom we briefly
-                        # tracked. No note is generated; the meeting continues.
+                        # tracked. No transcript is saved; the meeting continues.
                         restored = self._pending_abandoned["snapshot"]
                         self._pending_abandoned = None
                         self._write_tracking(meeting_id=meeting_id, session_mtime=mtime)
@@ -995,7 +964,7 @@ class ZoomEngine:
                         #
                         #   1) BACK-TO-BACK MEETINGS: the previous meeting really
                         #      happened, has a real accumulator with real
-                        #      conversation. Its note should be generated (the
+                        #      conversation. Its note should be saved (the
                         #      2026-05-04 AEO GA fix). We now DEFER that decision
                         #      rather than firing immediately (the 2026-06-30
                         #      single-meeting-flap fix): the note fires once the
@@ -1008,8 +977,8 @@ class ZoomEngine:
                         #      after briefly tracking the wrong meeting (the
                         #      original 2026-04-30 reason this branch existed).
                         #      Accumulator is small / has no real speakers.
-                        #      Discard as before — generating a note from
-                        #      misidentified noise wastes an LLM call and
+                        #      Discard as before — saving a note from
+                        #      misidentified noise writes a false transcript and
                         #      produces a confusing artifact.
                         #
                         # `_abandoned_looks_real` is the gate between the two.
@@ -1021,13 +990,13 @@ class ZoomEngine:
                         # haven't established a meeting_id context yet
                         # (meeting_id=None). Including them inflates the count
                         # and causes false-positives where a stale meeting +
-                        # 3 new-meeting utterances triggers abandoned generation.
+                        # 3 new-meeting utterances triggers abandoned saving.
                         strict_snapshot = {
                             k: v for k, v in abandoned_snapshot.items()
                             if v.get("meeting_id") == current_tracking_id
                         }
                         if self._abandoned_looks_real(strict_snapshot):
-                            # DEFER generation. If a DIFFERENT meeting is already
+                            # DEFER saving. If a DIFFERENT meeting is already
                             # pending, this switch supersedes it — flush the old
                             # pending now so its note isn't lost when we overwrite.
                             if (
@@ -1035,7 +1004,7 @@ class ZoomEngine:
                                 and self._pending_abandoned["meeting_id"]
                                 != current_tracking_id
                             ):
-                                self._trigger_abandoned_generation(
+                                self._trigger_abandoned_save(
                                     self._pending_abandoned["meeting_id"],
                                     self._pending_abandoned["snapshot"],
                                 )
@@ -1098,7 +1067,7 @@ class ZoomEngine:
 
             # Snapshot new entries into the accumulator on every change tick.
             # No meeting_id_filter here — we accumulate everything and filter
-            # at generation time. This prevents a stale meeting ID (detected
+            # at saving time. This prevents a stale meeting ID (detected
             # at IDLE→ACTIVE when old data was still in the WAL) from causing
             # new utterances to be silently dropped.
             try:
@@ -1178,13 +1147,13 @@ class ZoomEngine:
                     meeting_id=(self._read_tracking()[3] or ""),
                 )
 
-            # Resolve any deferred abandoned-meeting note now that the
+            # Resolve any deferred abandoned-meeting transcript now that the
             # accumulator reflects this tick's content: if the meeting we
             # switched to has accumulated real content of its own, the switch
-            # was a genuine back-to-back boundary and the abandoned note fires.
+            # was a genuine back-to-back boundary and the abandoned transcript fires.
             self._maybe_fire_pending_abandoned()
 
-            # Secondary idle trigger: fire generation when the accumulator
+            # Secondary idle trigger: fire saving when the accumulator
             # has been frozen for a long time even though the WAL file is
             # still being updated by Zoom checkpoint writes. This is the
             # "Jose Ocando" failure mode — meeting ends, Zoom keeps the WAL
@@ -1207,11 +1176,6 @@ class ZoomEngine:
                                 for e in self._accumulated.values()
                             )
                         if _has_content:
-                            _provider = cfg.llm_provider
-                            if _provider != "ollama":
-                                from zoom_config import get_api_key as _ak
-                                if not _ak(_provider):
-                                    return
                             self._emit_diag(
                                 "acc_stale_trigger",
                                 meeting_id=_stale_mid,
@@ -1219,7 +1183,7 @@ class ZoomEngine:
                                 threshold=acc_stale_threshold,
                             )
                             self._flush_pending_abandoned(reason="acc_stale")
-                            self._trigger_generate(origin, cfg)
+                            self._trigger_save(origin, cfg)
                             return
 
         else:
@@ -1232,7 +1196,7 @@ class ZoomEngine:
                     # generate or disarm the tracked one, so it isn't stranded.
                     self._flush_pending_abandoned(reason="idle")
 
-                    # Belt-and-suspenders: don't re-summarize a meeting we
+                    # Belt-and-suspenders: don't re-save a meeting we
                     # already finished. Zoom checkpoints the WAL after the
                     # meeting ends, which mutates mtime/size and would
                     # otherwise look like a new active period.
@@ -1249,8 +1213,8 @@ class ZoomEngine:
                     current_session_mtime = self._read_session_mtime()
                     if current_meeting_id is not None and \
                        current_session_mtime is not None and \
-                       self._last_generated_session is not None and \
-                       (current_meeting_id, current_session_mtime) == self._last_generated_session:
+                       self._last_saved_session is not None and \
+                       (current_meeting_id, current_session_mtime) == self._last_saved_session:
                         self._write_tracking(active_ts=None)
                         self._set_state(EngineState.IDLE)
                         return
@@ -1259,16 +1223,16 @@ class ZoomEngine:
                     # alone (you joining the room, Notetaker initializing,
                     # Zoom checkpoints, presence updates) can elapse the
                     # idle threshold without producing any real transcript
-                    # entries for the active meeting. Triggering generation
+                    # entries for the active meeting. Triggering saving
                     # in that state would either:
-                    #   - hand the LLM whatever stale cross-meeting data
+                    #   - save whatever stale cross-meeting data
                     #     the WAL still has (the 2026-04-29 contamination
                     #     where an Anna Punihaole [13:07:23] fragment from
                     #     a meeting hours earlier ended up as an entire
                     #     "Mike Nick" note), or
                     #   - fail with "No transcript entries found." now
                     #     that we've removed the unfiltered fallback in
-                    #     _collect_entries_for_generation.
+                    #     _collect_entries_for_save.
                     # Either way: don't trigger. Disarm and return to IDLE;
                     # the next genuine WAL change will re-arm us, and as
                     # soon as the late participant speaks, the accumulator
@@ -1291,28 +1255,16 @@ class ZoomEngine:
                             self._set_state(EngineState.IDLE)
                             return
 
-                    provider = cfg.llm_provider
-                    if provider != "ollama":
-                        from zoom_config import get_api_key as _get_key
-                        if not _get_key(provider):
-                            emit({"event": "error", "message": f"No API key set for {provider}. Open Settings to configure."})
-                            self._write_tracking(active_ts=None)  # disarm until WAL changes again
-                            return
-                    self._trigger_generate(origin, cfg)
+                    self._trigger_save(origin, cfg)
 
-    # ── Note generation ─────────────────────────────────────────────────────
+    # ── Note saving ─────────────────────────────────────────────────────
 
-    def _trigger_generate(self, origin, cfg) -> None:
-        """Start note generation in a background thread (non-blocking).
-
-        Wraps the work in a ThreadPoolExecutor so we can cap wall-clock time at
-        _GENERATE_TIMEOUT_SECS — a stuck LLM call must not pin the engine to
-        the GENERATING state forever.
-        """
-        if not self._generating_lock.acquire(blocking=False):
+    def _trigger_save(self, origin, cfg) -> None:
+        """Save the current transcript in a bounded background worker."""
+        if not self._saving_lock.acquire(blocking=False):
             return
 
-        self._set_state(EngineState.GENERATING)
+        self._set_state(EngineState.SAVING)
 
         # Snapshot tracking state under-lock so a restore-on-error can put us
         # back in a coherent ACTIVE-but-disarmed state.
@@ -1324,29 +1276,29 @@ class ZoomEngine:
         _, _, _, processing_meeting_id = self._read_tracking()
         processing_session_mtime = self._read_session_mtime()
 
-        # Reset the per-run note_failed flag so the worker can detect whether
-        # _generate_notes wrote a placeholder (LLM failure) or a final note.
-        self._last_run_note_failed = False
+        # Reset the per-run transcript_failed flag so the worker can detect whether
+        # _save_transcript saved the transcript or retained it for retry.
+        self._last_run_save_failed = False
 
         # Reset cancellation so this run starts clean. Any cancel signal
-        # raised below targets THIS generation only.
+        # raised below targets THIS saving only.
         self._cancel_event.clear()
 
         def worker():
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(self._generate_notes, origin, cfg)
+            future = executor.submit(self._save_transcript, origin, cfg)
             try:
-                future.result(timeout=_GENERATE_TIMEOUT_SECS)
+                future.result(timeout=_SAVE_TIMEOUT_SECS)
                 # Remember which session we just processed so we don't
                 # re-trigger if Zoom mutates the WAL on checkpoint. We do
-                # this even on note_failed — the user retries via the menu
+                # this even on transcript_failed — the user retries via the menu
                 # bar, not by waiting for another idle period.
                 if processing_meeting_id and processing_session_mtime is not None:
-                    self._last_generated_session = (
+                    self._last_saved_session = (
                         processing_meeting_id, processing_session_mtime
                     )
                 # Stamp the boundary anchor: the latest transcript timestamp
-                # we just summarized. The next IDLE -> ACTIVE will pass this
+                # we just saved. The next IDLE -> ACTIVE will pass this
                 # to `detect_active_meeting_id` so the just-completed
                 # meeting (whose entries are still resident in the WAL)
                 # cannot be re-detected as the new active meeting.
@@ -1357,20 +1309,20 @@ class ZoomEngine:
                             processing_meeting_id, latest, time.time(),
                         )
                 # Clean up the in-memory accumulator. Keep the persisted
-                # disk snapshot if note generation failed — it's the source
+                # disk snapshot if transcript saving failed — it's the source
                 # of truth for the retry flow.
                 with self._accumulated_lock:
                     self._accumulated = {}
-                if processing_meeting_id and not self._last_run_note_failed:
+                if processing_meeting_id and not self._last_run_save_failed:
                     delete_persisted_accumulator(processing_meeting_id)
                 self._wal_gone_since = None
                 # Anchor tracking to the WAL state we just consumed. We must
                 # NOT reset to None — that would make the next poll see the
                 # unchanged WAL as "new", flip back to ACTIVE, idle out, and
-                # regenerate the same notes in a loop.
+                # save the same transcript in a loop.
                 #
                 # Re-stat now so we capture any final writes Zoom did during
-                # the generation window; if the meeting really is over the
+                # the saving window; if the meeting really is over the
                 # next poll's mtime/size will match these and `changed`
                 # stays False until a NEW meeting starts.
                 try:
@@ -1388,12 +1340,8 @@ class ZoomEngine:
                 except OSError:
                     self._reset_tracking()
             except concurrent.futures.TimeoutError:
-                emit({"event": "error", "message": "Note generation timed out — try again"})
-                # future.cancel() is a no-op once the work has started, so
-                # signal cooperative cancellation. The summarize() thread
-                # will observe this between retries / during backoff sleep
-                # and bail out with CancelledError. Worst-case latency is
-                # bounded by the urllib per-call timeout (_HTTP_TIMEOUT_SECS).
+                self._record_save_failure(processing_meeting_id, "Recovered meeting", "", TimeoutError("Transcript saving timed out — try again"))
+                # Cancel before a delayed worker writes a file.
                 self._cancel_event.set()
                 future.cancel()
                 self._write_tracking(
@@ -1402,7 +1350,7 @@ class ZoomEngine:
                 )
                 self._wal_gone_since = None
             except Exception as exc:
-                emit({"event": "error", "message": _friendly_error(exc)})
+                self._record_save_failure(processing_meeting_id, "Recovered meeting", "", exc)
                 self._write_tracking(
                     mtime=saved_mtime, size=saved_size,
                     active_ts=None, meeting_id=None,
@@ -1410,256 +1358,69 @@ class ZoomEngine:
                 self._wal_gone_since = None
             finally:
                 executor.shutdown(wait=False)
-                self._generating_lock.release()
+                self._saving_lock.release()
                 self._set_state(EngineState.IDLE)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _generate_notes(self, origin, cfg) -> None:
-        """Three-stage finalization: build transcript, save transcript, generate note.
-
-        Save-transcript is the durability boundary — once it succeeds, the
-        meeting's content is safe on disk regardless of what happens to the
-        LLM call. LLM failures produce a placeholder note (saved alongside
-        the transcript) and a retryable `note_failed` event, NOT a hard error.
-        """
-        gen_start = time.monotonic()
+    def _save_transcript(self, origin, cfg) -> None:
+        """Collect the tracked meeting and save its transcript locally."""
         transcript_wal = self._resolve_wal(origin, cfg, "transcript")
         blocks_wal = self._resolve_wal(origin, cfg, "blocks")
-
-        _, _, _, active_meeting_id = self._read_tracking()
-
-        entries, recovered_meeting_id = self._collect_entries_for_generation(
-            transcript_wal, active_meeting_id
-        )
-        # If self-heal recovered a different meeting_id, treat it as the
-        # canonical id from here on. Update tracking so the post-success
-        # boundary anchor + frontmatter + diag events all reflect what
-        # actually got summarized — not the misidentified id we entered
-        # generation with.
-        if recovered_meeting_id and recovered_meeting_id != active_meeting_id:
-            self._emit_diag(
-                "active_id_self_healed",
-                from_id=active_meeting_id or "",
-                to_id=recovered_meeting_id,
-                entry_count=len(entries),
-            )
-            self._write_tracking(meeting_id=recovered_meeting_id)
-            active_meeting_id = recovered_meeting_id
-
-        if not transcript_wal and not entries:
-            raise RuntimeError("Transcript WAL not found during generation.")
-
+        _, _, _, meeting_id = self._read_tracking()
+        entries, recovered_id = self._collect_entries_for_save(transcript_wal, meeting_id)
+        if recovered_id and recovered_id != meeting_id:
+            self._write_tracking(meeting_id=recovered_id)
+            meeting_id = recovered_id
         if not entries:
             raise RuntimeError("No transcript entries found.")
-
-        # Refuse to generate a note from a near-empty transcript — this
-        # catches recurring meetings (static meeting_id) whose Notetaker
-        # only captured a brief opening monologue before the WAL went
-        # quiet. Threshold matches _abandoned_looks_real for consistency.
-        entries_by_id = {e.get("msg_id", str(i)): e for i, e in enumerate(entries)}
-        if not self._abandoned_looks_real(entries_by_id):
-            emit({
-                "event": "error",
-                "message": (
-                    f"Skipped note generation — only {len(entries)} transcript "
-                    f"entr{'y' if len(entries) == 1 else 'ies'} found "
-                    f"(minimum 5 with at least one identified speaker required)."
-                ),
-            })
-            return
-
         cfg = self._get_cfg()
-
-        meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
-        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
-        date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
-
-        seen: dict[str, None] = {}
-        for e in entries:
-            s = e["speaker"]
-            if s and s != "Unknown":
-                seen[s] = None
-        attendees = list(seen.keys())
-
-        created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        transcript_text = format_transcript(entries)
-
-        # When neither Apple Calendar nor the blocks WAL could supply a title,
-        # _derive_meeting_title falls back to "Zoom Meeting YYYY-MM-DD HH:MM".
-        # Ask the LLM for a short descriptive title instead.
-        if meeting_title.startswith("Zoom Meeting "):
-            ai_title = generate_title(transcript_text, cfg)
-            if ai_title:
-                meeting_title = ai_title
-                date_match = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
-                if not date_match:
-                    date_str = datetime.now().strftime("%Y-%m-%d")
-
-        # ── Stage 1: save transcript (durability boundary) ─────────────────
-        # Thread `active_meeting_id` through so a same-day same-title
-        # collision (e.g. two unrelated Zoom calls that both slug to
-        # "Daily Standup" because the second one had no AI Notetaker
-        # title) lands as a `-2` sibling instead of clobbering the first
-        # meeting's note. The 2026-04-30 incident was exactly this:
-        # a follow-up 1:1 wiped the morning standup's saved note.
-        #
-        # The note_link in the transcript content will be corrected once we
-        # know the actual note path (Stage 3). Write a best-guess link now
-        # so the file is immediately useful even in the failure path.
-        transcript_content = build_transcript_content(
-            transcript_text, meeting_title, date_str, cfg,
-            meeting_id=active_meeting_id,
-        )
-        transcript_path = save_transcript_only(
-            transcript_content, meeting_title, date_str, cfg,
-            meeting_id=active_meeting_id,
-        )
-        slug = slugify_title(meeting_title, fallback_date=date_str)
-
-        # Actual transcript link derived from the file that was just saved.
-        # This accounts for any -2/-3 suffix that _resolve_save_path assigned.
-        actual_transcript_link = _path_to_vault_link(transcript_path, cfg, "transcript", date_str)
-
-        # ── Stage 2: generate note via LLM ─────────────────────────────────
+        title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", title)
+        date_str = match.group(1) if match else datetime.now().strftime("%Y-%m-%d")
         try:
-            summary = summarize(
-                transcript_text, meeting_title, cfg, cancel_event=self._cancel_event
-            )
-        except CancelledError:
-            # A cancelled run leaves the transcript on disk (Stage 1 already
-            # ran) and the persisted accumulator intact for retry. We do NOT
-            # write a placeholder — a cancellation note in the user's vault
-            # would be confusing noise.
-            #
-            # We DO emit note_failed so the menu bar shows an in-session retry
-            # item immediately (not just at the next launch). Guard against a
-            # new meeting having started while the LLM was timing out — if the
-            # engine is no longer IDLE, skip the emit to avoid flipping the
-            # active meeting's displayed state to idle.
-            self._last_run_note_failed = True
-            _title_slug = slugify_title(meeting_title, fallback_date=date_str)
-            failed_meta = {
-                "meeting_id": active_meeting_id or "",
-                "title": _title_slug,
-                "note_path": "",
-                "transcript_path": str(transcript_path),
-                "message": "API call timed out — the LLM took too long to respond",
-                "date_str": date_str,
-                "attendees": attendees,
-            }
-            self._last_failed_meeting = failed_meta
-            if active_meeting_id:
-                mark_meeting_failed(active_meeting_id, metadata=failed_meta)
-            if self._get_state() == EngineState.IDLE:
-                emit({
-                    "event": "note_failed",
-                    "title": _title_slug,
-                    "meeting_id": active_meeting_id or "",
-                    "note_path": "",
-                    "transcript_path": str(transcript_path),
-                    "message": failed_meta["message"],
-                    "attendees": attendees,
-                })
-            return
+            self._write_transcript(entries, title, date_str, cfg, meeting_id)
         except Exception as exc:
-            error_msg = _friendly_error(exc)
-            placeholder = build_placeholder_note(
-                meeting_title=meeting_title,
-                date_str=date_str,
-                attendees=attendees,
-                created_iso=created_iso,
-                error_message=error_msg,
-                meeting_id=active_meeting_id or "",
-                cfg=cfg,
-                transcript_link_override=actual_transcript_link,
-            )
-            placeholder_path = save_note_only(
-                placeholder, meeting_title, date_str, cfg,
-                meeting_id=active_meeting_id,
-            )
-            # Update transcript with the actual note link now that we know where it landed.
-            actual_note_link = _path_to_vault_link(placeholder_path, cfg, "note", date_str)
-            updated_transcript = build_transcript_content(
-                transcript_text, meeting_title, date_str, cfg,
-                meeting_id=active_meeting_id,
-                note_link_override=actual_note_link,
-            )
-            _atomic_write_text(transcript_path, updated_transcript)
-            self._last_run_note_failed = True
-            failed_record = {
-                "meeting_id": active_meeting_id or "",
-                "title": slug,
-                "note_path": str(placeholder_path),
-                "transcript_path": str(transcript_path),
-                "message": error_msg,
-                "date_str": date_str,
-                "attendees": attendees,
-            }
-            self._last_failed_meeting = failed_record
-            # Promote the snapshot from root cache into `failed/` so the
-            # 30-day purge applies (instead of 24h) and the menu bar can
-            # surface a labeled recovery item even after a long delay.
-            # This MUST run before the worker's post-_generate_notes
-            # cleanup — that block keeps the root snapshot intact only
-            # while `_last_run_note_failed` is True; promoting it here
-            # means root is empty afterward and `failed/` owns the data.
-            if active_meeting_id:
-                mark_meeting_failed(active_meeting_id, metadata=failed_record)
-            emit({
-                "event": "note_failed",
-                "title": slug,
-                "note_path": str(placeholder_path),
-                "transcript_path": str(transcript_path),
-                "meeting_id": active_meeting_id or "",
-                "attendees": attendees,
-                "message": error_msg,
-            })
-            return
+            self._last_run_save_failed = True
+            self._record_save_failure(meeting_id, title, date_str, exc)
 
-        # ── Stage 3: save the final note ───────────────────────────────────
-        note_content = build_note_content(
-            summary, meeting_title, date_str, attendees, created_iso, cfg,
-            meeting_id=active_meeting_id,
-            transcript_link_override=actual_transcript_link,
+    def _write_transcript(
+        self, entries, title, date_str, cfg, meeting_id,
+        *, background=False, cancel_event=None,
+    ) -> Path:
+        """Shared local-only save path for completion, recovery, and back-to-back meetings."""
+        if cancel_event is None:
+            cancel_event = self._cancel_event
+        if cancel_event.is_set():
+            raise CancelledError("Transcript saving cancelled")
+        content = build_transcript_content(
+            format_transcript(entries), title, date_str, cfg, meeting_id=meeting_id,
         )
-        note_path = save_note_only(
-            note_content, meeting_title, date_str, cfg,
-            meeting_id=active_meeting_id,
-        )
-
-        # Update transcript with the actual note link now that we know where it landed.
-        actual_note_link = _path_to_vault_link(note_path, cfg, "note", date_str)
-        updated_transcript = build_transcript_content(
-            transcript_text, meeting_title, date_str, cfg,
-            meeting_id=active_meeting_id,
-            note_link_override=actual_note_link,
-        )
-        _atomic_write_text(transcript_path, updated_transcript)
-
+        path = save_transcript_only(content, title, date_str, cfg, meeting_id=meeting_id)
+        attendees = list(dict.fromkeys(
+            e["speaker"] for e in entries
+            if e.get("speaker") and e["speaker"] != "Unknown"
+        ))
         emit({
-            "event": "done",
-            "title": slug,
-            "path": str(note_path),
-            "transcript_path": str(transcript_path),
-            "attendees": attendees,
-            "meeting_id": active_meeting_id or "",
+            "event": "done", "title": slugify_title(title, fallback_date=date_str),
+            "path": str(path), "transcript_path": str(path), "attendees": attendees,
+            "meeting_id": meeting_id or "", "background": background,
         })
+        self._emit_diag("transcript_saved", meeting_id=meeting_id or "", entry_count=len(entries))
+        return path
 
-        # Diag: how long did this take, how big was the transcript, which
-        # provider/model. Useful for spotting regressions ("LLM is slow this
-        # week") without instrumenting the user's machine further.
-        self._emit_diag(
-            "generation_completed",
-            duration_ms=int((time.monotonic() - gen_start) * 1000),
-            entry_count=len(entries),
-            attendee_count=len(attendees),
-            provider=cfg.llm_provider,
-            model=cfg.llm_model,
-            meeting_id=active_meeting_id or "",
-        )
+    def _record_save_failure(self, meeting_id, title, date_str, exc, *, background=False):
+        """Retain captured speech for retry when writing the transcript fails."""
+        metadata = {
+            "meeting_id": meeting_id or "", "title": title, "date_str": date_str,
+            "message": _friendly_error(exc),
+        }
+        self._last_failed_meeting = metadata
+        if meeting_id:
+            mark_meeting_failed(meeting_id, metadata=metadata)
+        emit({"event": "transcript_failed", **metadata, "background": background})
 
-    def _collect_entries_for_generation(self, transcript_wal, active_meeting_id):
+    def _collect_entries_for_save(self, transcript_wal, active_meeting_id):
         """Pick the best entries source: in-memory accumulator > WAL > disk snapshot.
 
         Filter by active_meeting_id at this stage (not at poll time) so a stale
@@ -1702,7 +1463,7 @@ class ZoomEngine:
             # tick missed it). Without this branch, the `else` path below
             # used to return EVERY accumulator entry — including stale
             # cross-day fragments like Anna Punihaole's [13:07:23] from
-            # yesterday — which then poisoned title parsing and the LLM
+            # yesterday — which then poisoned title parsing and the saved transcript
             # input. With this branch we recover the right id from
             # accumulator content (most-common id with a session-fresh
             # timestamp); if we can't, we return an empty list rather
@@ -1718,7 +1479,7 @@ class ZoomEngine:
                     recovered_entries.sort(key=lambda e: e.get("timestamp") or "")
                     return recovered_entries, recovered
                 # No anchor or no fresh-enough id found. Better to fail
-                # cleanly than to summarize yesterday's Anna fragment.
+                # cleanly than to save yesterday's Anna fragment.
                 return [], None
 
             # Compute the session-start floor for anonymous entries.
@@ -1851,7 +1612,7 @@ class ZoomEngine:
         # start but also numerically > now-by-hours. A real in-progress entry
         # can never be more than a few seconds ahead of the current time.
         # The boundary check mirrors detect_active_meeting_id: don't re-select
-        # a meeting we just finished generating notes for.
+        # a meeting we just finished saving transcripts for.
         _FUTURE_BUF_R = 5 * 60
         boundary = self._active_boundary()  # (exc_id, floor, set_at) or None
 
@@ -1886,20 +1647,9 @@ class ZoomEngine:
     def _derive_meeting_title(self, blocks_wal, transcript_wal, entries) -> str:
         anchor_entries = [e for e in entries if e.get("meeting_id")] or entries
 
-        # Apple Calendar is the most authoritative source — it has the actual
-        # invite name. Try it first. Falls back to None if the sidecar is
-        # absent, stale, or no event window overlaps the transcript.
+        # Use Zoom's cached title when available, otherwise a dated fallback.
         meeting_title = None
-        try:
-            meeting_title = read_calendar_title(anchor_entries)
-        except Exception:
-            pass
-
-        # WAL title as fallback — Zoom's own title detection. Can produce
-        # speaker names or "Google Calendar Meeting (not synced)" for meetings
-        # where Zoom couldn't read the calendar, but is better than nothing
-        # when no calendar event matched.
-        if not meeting_title and blocks_wal:
+        if blocks_wal:
             try:
                 meeting_title = parse_meeting_title(blocks_wal, anchor_entries)
             except Exception:
@@ -1928,11 +1678,11 @@ class ZoomEngine:
         action = cmd.get("cmd")
         if action == "reload":
             self._reload_requested = True
-        elif action == "generate":
+        elif action == "save":
             cfg = self._get_cfg()
             origin = find_origin_dir()
             if origin:
-                self._trigger_generate(origin, cfg)
+                self._trigger_save(origin, cfg)
             else:
                 emit({"event": "error", "message": "Zoom WAL directory not found."})
         elif action == "retry":
@@ -1940,8 +1690,7 @@ class ZoomEngine:
             self._trigger_retry(meeting_id)
         elif action == "recover":
             # Recovery is mechanically identical to retry — load the persisted
-            # accumulator, re-derive title from blocks WAL, run the LLM,
-            # write the note. The distinction is purely intent-level: retry
+            # accumulator, re-derive title from blocks WAL, save the transcript. The distinction is purely intent-level: retry
             # operates on a meeting whose failure was just observed in this
             # engine session; recover operates on one whose failure happened
             # in a prior session and was found at startup.
@@ -1964,7 +1713,7 @@ class ZoomEngine:
                 emit({"event": "dismissed", "meeting_id": mid})
         elif action == "clear_cache":
             # Delete every in-progress snapshot from the root cache dir.
-            # Leaves failed/ intact — those are deliberate LLM-failure survivors
+            # Leaves failed/ intact — those are deliberate failed-save survivors
             # that the user must explicitly discard via the recovery menu.
             count = 0
             if _CACHE_DIR.exists():
@@ -1976,7 +1725,7 @@ class ZoomEngine:
                         pass
             emit({"event": "cache_cleared", "count": count})
 
-    # ── Abandoned-meeting auto-generation ───────────────────────────────────
+    # ── Abandoned-meeting auto-saving ───────────────────────────────────
 
     @staticmethod
     def _abandoned_looks_real(snapshot: dict) -> bool:
@@ -1987,14 +1736,14 @@ class ZoomEngine:
 
           1) BACK-TO-BACK MEETINGS: the previous meeting really happened,
              produced a real transcript, and a new meeting just started.
-             We want to generate a note for it (the 2026-05-04 AEO GA bug).
+             We want to save a transcript for it (the 2026-05-04 AEO GA bug).
 
           2) MISIDENTIFICATION: the engine briefly tracked the wrong
              meeting (e.g. stale WAL data still resident at IDLE -> ACTIVE),
              and detection has now corrected itself. The accumulator at
              this point is small and contains no real conversation.
 
-        We only auto-generate when the snapshot looks like (1). Heuristic:
+        We only auto-save when the snapshot looks like (1). Heuristic:
         at least 5 entries AND at least one non-Unknown speaker. Tuned
         conservatively — a 30-second exchange has more than 5 entries,
         and a misidentification typically captures 0-2 utterances before
@@ -2009,7 +1758,7 @@ class ZoomEngine:
         return False
 
     def _maybe_fire_pending_abandoned(self) -> None:
-        """Generate a deferred abandoned-meeting note once the switch is proven.
+        """Save a deferred abandoned-meeting transcript once the switch is proven.
 
         The 2026-06-30 single-meeting-flap fix: Case B no longer generates an
         abandoned meeting's note the instant the tracked meeting_id changes,
@@ -2024,11 +1773,11 @@ class ZoomEngine:
             note and clear the pending state.
           - Otherwise leave it pending. A flap swings the score back to the
             abandoned id first, and the flap-back guard in Case B restores it
-            without ever generating. A genuine new meeting clears this bar
+            without ever saving. A genuine new meeting clears this bar
             within a tick or two of real speech.
 
-        Idle/secondary-idle generation flushes any leftover pending note via
-        the same `_trigger_abandoned_generation` path (see `_flush_pending_abandoned`).
+        Idle/secondary-idle saving flushes any leftover pending transcript via
+        the same `_trigger_abandoned_save` path (see `_flush_pending_abandoned`).
         """
         pending = self._pending_abandoned
         if not pending:
@@ -2043,20 +1792,20 @@ class ZoomEngine:
             }
         if self._abandoned_looks_real(new_strict):
             self._emit_diag(
-                "abandoned_generation_promoted",
+                "abandoned_saving_promoted",
                 abandoned_id=pending["meeting_id"],
                 new_meeting_id=tracked_id,
                 new_entry_count=len(new_strict),
             )
-            self._trigger_abandoned_generation(
+            self._trigger_abandoned_save(
                 pending["meeting_id"], pending["snapshot"],
             )
             self._pending_abandoned = None
 
     def _flush_pending_abandoned(self, reason: str) -> None:
-        """Generate any still-pending abandoned note before going idle.
+        """Save any still-pending abandoned transcript before going idle.
 
-        Reached when the engine decides to generate / disarm the currently
+        Reached when the engine decides to save / disarm the currently
         tracked meeting while a different meeting is still parked in
         `_pending_abandoned` (the meeting we switched to ended or fell silent
         before accumulating enough to promote the deferral on its own). The
@@ -2066,39 +1815,20 @@ class ZoomEngine:
         if not pending:
             return
         self._emit_diag(
-            "abandoned_generation_flushed",
+            "abandoned_saving_flushed",
             abandoned_id=pending["meeting_id"],
             reason=reason,
         )
-        self._trigger_abandoned_generation(pending["meeting_id"], pending["snapshot"])
+        self._trigger_abandoned_save(pending["meeting_id"], pending["snapshot"])
         self._pending_abandoned = None
 
-    def _trigger_abandoned_generation(self, meeting_id: str, snapshot: dict) -> None:
-        """Finalize an accumulator that Case B is about to abandon.
-
-        Mirrors `_trigger_retry` but with three differences that matter for
-        the back-to-back-meetings use case:
-
-          - Saves the transcript file (Stage 1 of `_generate_notes`). Retry
-            assumes the transcript is already on disk; abandoned generation
-            is the FIRST chance to save it.
-          - Acquires `_generating_lock` with `blocking=True` so it queues
-            behind any in-flight generation instead of being rejected.
-          - Does NOT call `self._set_state(EngineState.GENERATING)`. The
-            engine is now ACTIVE for a different meeting; flipping to
-            GENERATING would freeze polling and lose transcript content
-            from the new meeting.
-
-        The caller (Case B in `_poll_once`) is expected to clear the
-        in-memory accumulator and switch tracking AFTER calling this — the
-        snapshot is captured by-value here, so the caller is free to
-        mutate live state immediately.
-        """
+    def _trigger_abandoned_save(self, meeting_id: str, snapshot: dict) -> None:
+        """Save an ended meeting while continuing to capture the next one."""
         if not meeting_id or not snapshot:
             return
 
         # Persist a fresh snapshot to disk synchronously, BEFORE spawning
-        # the worker. If the engine crashes or quits mid-generation, the
+        # the worker. If the engine crashes or quits mid-saving, the
         # snapshot is what `find_orphaned_accumulators` will surface for
         # menu-bar recovery on next launch.
         try:
@@ -2110,10 +1840,11 @@ class ZoomEngine:
         snapshot_copy = dict(snapshot)
 
         def worker():
-            # Block until any in-flight generation finishes so two boundary
+            meeting_title, date_str = "Recovered meeting", ""
+            # Block until any in-flight saving finishes so two boundary
             # events back-to-back (A -> B -> C in rapid succession) serialize
-            # cleanly through one LLM at a time.
-            self._generating_lock.acquire(blocking=True)
+            # cleanly through one save at a time.
+            self._saving_lock.acquire(blocking=True)
             try:
                 # Filter snapshot to only entries for this meeting_id (or
                 # entries with no meeting_id, which are early WAL pages that
@@ -2157,119 +1888,10 @@ class ZoomEngine:
                         seen[s] = None
                 attendees = list(seen.keys())
 
-                created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                transcript_text = format_transcript(entries)
-
-                if meeting_title.startswith("Zoom Meeting "):
-                    ai_title = generate_title(transcript_text, cfg)
-                    if ai_title:
-                        meeting_title = ai_title
-                        m2 = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
-                        if not m2:
-                            date_str = datetime.now().strftime("%Y-%m-%d")
-
-                slug = slugify_title(meeting_title, fallback_date=date_str)
-
-                self._emit_diag(
-                    "abandoned_generation_started",
-                    meeting_id=meeting_id,
-                    entry_count=len(entries),
-                    attendee_count=len(attendees),
+                transcript_path = self._write_transcript(
+                    entries, meeting_title, date_str, cfg, meeting_id,
+                    background=True, cancel_event=threading.Event(),
                 )
-
-                # Stage 1: save transcript (durability boundary). Threads
-                # `meeting_id` through so a same-day same-title collision
-                # lands as a `-2` sibling instead of clobbering an existing
-                # note.
-                transcript_content = build_transcript_content(
-                    transcript_text, meeting_title, date_str, cfg,
-                    meeting_id=meeting_id,
-                )
-                transcript_path = save_transcript_only(
-                    transcript_content, meeting_title, date_str, cfg,
-                    meeting_id=meeting_id,
-                )
-                actual_transcript_link = _path_to_vault_link(
-                    transcript_path, cfg, "transcript", date_str
-                )
-
-                # Stage 2: LLM. Use a fresh cancel event so cancellation
-                # signals targeted at the main-meeting generation don't
-                # also kill this background one.
-                local_cancel = threading.Event()
-                try:
-                    summary = summarize(
-                        transcript_text, meeting_title, cfg,
-                        cancel_event=local_cancel,
-                    )
-                except CancelledError:
-                    return
-                except Exception as exc:
-                    error_msg = _friendly_error(exc)
-                    placeholder = build_placeholder_note(
-                        meeting_title=meeting_title,
-                        date_str=date_str,
-                        attendees=attendees,
-                        created_iso=created_iso,
-                        error_message=error_msg,
-                        meeting_id=meeting_id,
-                        cfg=cfg,
-                        transcript_link_override=actual_transcript_link,
-                    )
-                    placeholder_path = save_note_only(
-                        placeholder, meeting_title, date_str, cfg,
-                        meeting_id=meeting_id,
-                    )
-                    actual_note_link = _path_to_vault_link(
-                        placeholder_path, cfg, "note", date_str
-                    )
-                    updated_transcript = build_transcript_content(
-                        transcript_text, meeting_title, date_str, cfg,
-                        meeting_id=meeting_id,
-                        note_link_override=actual_note_link,
-                    )
-                    _atomic_write_text(transcript_path, updated_transcript)
-                    failed_record = {
-                        "meeting_id": meeting_id,
-                        "title": slug,
-                        "note_path": str(placeholder_path),
-                        "transcript_path": str(transcript_path),
-                        "message": error_msg,
-                        "date_str": date_str,
-                        "attendees": attendees,
-                    }
-                    # Promote into failed/ so the menu bar surfaces a retry
-                    # item — same recovery flow as a regular LLM failure.
-                    mark_meeting_failed(meeting_id, metadata=failed_record)
-                    emit({
-                        "event": "note_failed",
-                        "title": slug,
-                        "note_path": str(placeholder_path),
-                        "transcript_path": str(transcript_path),
-                        "meeting_id": meeting_id,
-                        "attendees": attendees,
-                        "message": error_msg,
-                        "background": True,
-                    })
-                    return
-
-                # Stage 3: save final note.
-                note_content = build_note_content(
-                    summary, meeting_title, date_str, attendees, created_iso, cfg,
-                    meeting_id=meeting_id,
-                    transcript_link_override=actual_transcript_link,
-                )
-                note_path = save_note_only(
-                    note_content, meeting_title, date_str, cfg,
-                    meeting_id=meeting_id,
-                )
-                actual_note_link = _path_to_vault_link(note_path, cfg, "note", date_str)
-                updated_transcript = build_transcript_content(
-                    transcript_text, meeting_title, date_str, cfg,
-                    meeting_id=meeting_id,
-                    note_link_override=actual_note_link,
-                )
-                _atomic_write_text(transcript_path, updated_transcript)
 
                 # Stamp boundary anchor so the next IDLE -> ACTIVE pass
                 # cannot re-detect this meeting from leftover WAL data.
@@ -2292,213 +1914,66 @@ class ZoomEngine:
                 # Cleanup persisted snapshot — the note is now safe on disk.
                 delete_persisted_accumulator(meeting_id)
 
-                emit({
-                    "event": "done",
-                    "title": slug,
-                    "path": str(note_path),
-                    "transcript_path": str(transcript_path),
-                    "attendees": attendees,
-                    "meeting_id": meeting_id,
-                    "background": True,
-                })
-                self._emit_diag(
-                    "abandoned_generation_completed",
-                    meeting_id=meeting_id,
-                    entry_count=len(entries),
-                )
             except Exception as exc:
                 # Don't lose the snapshot on unexpected error — leave it on
                 # disk so menu-bar recovery can surface it next launch.
-                emit({"event": "error", "message": _friendly_error(exc)})
+                self._record_save_failure(meeting_id, meeting_title, date_str, exc, background=True)
             finally:
-                self._generating_lock.release()
+                self._saving_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
     # ── Retry flow ──────────────────────────────────────────────────────────
 
     def _trigger_retry(self, meeting_id: str) -> None:
-        """Re-run note generation for a previously-failed meeting.
-
-        Loads the persisted accumulator from disk, re-runs the LLM stage,
-        and overwrites the placeholder note on success. The transcript on
-        disk is left as-is. Emits `done` on success or `error` on failure.
-        """
-        if not self._generating_lock.acquire(blocking=False):
-            emit({"event": "error", "message": "Generation already in progress."})
+        """Save a transcript retained after a crash or an earlier disk write failure."""
+        if not self._saving_lock.acquire(blocking=False):
+            emit({"event": "error", "message": "Transcript saving already in progress."})
             return
-
-        # Resolve which failed meeting to retry. If the caller didn't pass a
-        # meeting_id, use the most recent failure (driven from the menu bar).
-        failed = self._last_failed_meeting
-        if not meeting_id and failed:
-            meeting_id = failed.get("meeting_id") or ""
-        if failed and failed.get("meeting_id") != meeting_id:
-            failed = None  # caller is retrying a different meeting
-
+        failed = self._last_failed_meeting or {}
+        meeting_id = meeting_id or failed.get("meeting_id", "")
         if not meeting_id:
-            self._generating_lock.release()
-            emit({"event": "error", "message": "No failed meeting to retry."})
+            self._saving_lock.release()
+            emit({"event": "error", "message": "No failed transcript to retry."})
             return
-
-        # For cross-session recovery (the "recover" cmd sent from a prior engine
-        # session), _last_failed_meeting is None because it lives only in memory.
-        # Load the on-disk sidecar so the retry has the correct title, note_path,
-        # transcript_path, date_str, and attendees from the original failure.
-        # Only use the sidecar when it carries real generation metadata (title +
-        # date_str). Demoted snapshots have only `demoted_at` / `message` —
-        # for those, fall through to the re-derive path below so the worker
-        # doesn't use today's date for a meeting from a prior day.
-        if failed is None and meeting_id:
-            sidecar = load_failed_sidecar(meeting_id)
-            if sidecar and sidecar.get("title") and sidecar.get("date_str"):
-                failed = sidecar
-
+        metadata = load_failed_sidecar(meeting_id) or {}
         cfg = self._get_cfg()
-        # Reset cancellation for this retry — a prior cancelled run must
-        # not cause the retry to abort instantly.
         self._cancel_event.clear()
+        # Recovery must not pause capture of a different live meeting.
+        background = self._get_state() == EngineState.ACTIVE
 
         def worker():
-            self._set_state(EngineState.GENERATING)
+            title, date_str = metadata.get("title", ""), metadata.get("date_str", "")
+            if not background:
+                self._set_state(EngineState.SAVING)
             try:
                 persisted = load_persisted_accumulator(meeting_id)
                 if not persisted:
-                    emit({
-                        "event": "error",
-                        "message": "Cached transcript no longer available for retry.",
-                    })
-                    return
+                    raise RuntimeError("Cached transcript no longer available for recovery.")
                 entries = sorted(
-                    persisted.values(), key=lambda e: e.get("timestamp") or ""
+                    (e for e in persisted.values() if not e.get("meeting_id") or e["meeting_id"] == meeting_id),
+                    key=lambda e: e.get("timestamp") or "",
                 )
                 if not entries:
-                    emit({"event": "error", "message": "No transcript entries to retry."})
-                    return
-
-                # Reuse failure metadata when available; otherwise re-derive.
-                if failed:
-                    meeting_title = failed.get("title") or ""
-                    date_str = failed.get("date_str") or datetime.now().strftime("%Y-%m-%d")
-                    attendees = list(failed.get("attendees") or [])
-                    placeholder_path_str = failed.get("note_path") or ""
-                else:
-                    origin = find_origin_dir()
-                    blocks_wal = self._resolve_wal(origin, cfg, "blocks") if origin else None
-                    transcript_wal = self._resolve_wal(origin, cfg, "transcript") if origin else None
-                    meeting_title = self._derive_meeting_title(blocks_wal, transcript_wal, entries)
-                    m = re.search(r"(\d{4}-\d{2}-\d{2})", meeting_title)
-                    if m:
-                        date_str = m.group(1)
-                    else:
-                        # Use the snapshot file's mtime as the date — avoids stamping
-                        # old recovered meetings with today's date when the blocks
-                        # WAL no longer holds a title for them.
-                        snap_path, _ = _persisted_paths(meeting_id)
-                        try:
-                            date_str = datetime.fromtimestamp(
-                                snap_path.stat().st_mtime
-                            ).strftime("%Y-%m-%d") if snap_path else datetime.now().strftime("%Y-%m-%d")
-                        except OSError:
-                            date_str = datetime.now().strftime("%Y-%m-%d")
-                    seen: dict[str, None] = {}
-                    for e in entries:
-                        s = e.get("speaker")
-                        if s and s != "Unknown":
-                            seen[s] = None
-                    attendees = list(seen.keys())
-                    placeholder_path_str = ""
-
-                created_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                transcript_text = format_transcript(entries)
-                slug = slugify_title(meeting_title, fallback_date=date_str)
-
-                try:
-                    summary = summarize(
-                        transcript_text, meeting_title, cfg,
-                        cancel_event=self._cancel_event,
-                    )
-                except CancelledError:
-                    # Retry was cancelled (e.g. user quit the app). Leave
-                    # the failed/ snapshot intact so the next launch still
-                    # surfaces the recovery item.
-                    emit({"event": "error", "message": "Retry cancelled"})
-                    return
-                except Exception as exc:
-                    err_msg = _friendly_error(exc)
-                    # Refresh the failed/ sidecar so the menu bar shows the
-                    # latest error and a fresh `failed_at` (the file's mtime
-                    # also gets bumped, which keeps it inside the 30-day
-                    # purge window for another month). The .json/.md moves
-                    # are no-ops when already in failed/, so this is safe
-                    # to call repeatedly.
-                    mark_meeting_failed(meeting_id, metadata={
-                        "meeting_id": meeting_id,
-                        "title": slug,
-                        "note_path": placeholder_path_str,
-                        "transcript_path": (failed or {}).get("transcript_path", ""),
-                        "message": err_msg,
-                        "date_str": date_str,
-                        "attendees": attendees,
-                    })
-                    emit({
-                        "event": "note_failed",
-                        "title": slug,
-                        "note_path": placeholder_path_str,
-                        "transcript_path": (failed or {}).get("transcript_path", ""),
-                        "meeting_id": meeting_id,
-                        "attendees": attendees,
-                        "message": err_msg,
-                    })
-                    return
-
-                # Derive the actual transcript link from the saved transcript path
-                # so the note points to the right file (e.g. "…-2" suffix).
-                from pathlib import Path as _Path
-                transcript_path_str = (failed or {}).get("transcript_path", "")
-                transcript_link_override = None
-                if transcript_path_str and _Path(transcript_path_str).exists():
-                    transcript_link_override = _path_to_vault_link(
-                        _Path(transcript_path_str), cfg, "transcript", date_str
-                    )
-
-                note_content = build_note_content(
-                    summary, meeting_title, date_str, attendees, created_iso, cfg,
-                    meeting_id=meeting_id,
-                    transcript_link_override=transcript_link_override,
-                )
-
-                # Overwrite the placeholder note in place if we know its path,
-                # otherwise write a fresh note (which save_note_only will
-                # disambiguate via _resolve_save_path using meeting_id).
-                if placeholder_path_str and _Path(placeholder_path_str).exists():
-                    overwrite_note(_Path(placeholder_path_str), note_content)
-                    note_path = _Path(placeholder_path_str)
-                else:
-                    note_path = save_note_only(
-                        note_content, meeting_title, date_str, cfg,
-                        meeting_id=meeting_id,
-                    )
-
-                # Cleanup: drop the persisted accumulator and forget the
-                # last-failed meeting so the menu bar Retry item disappears.
+                    raise RuntimeError("No transcript entries to recover.")
+                snapshot_path, _ = _persisted_paths(meeting_id)
+                snapshot_date = datetime.fromtimestamp(snapshot_path.stat().st_mtime).strftime("%Y-%m-%d") if snapshot_path else datetime.now().strftime("%Y-%m-%d")
+                origin = find_origin_dir()
+                blocks = self._resolve_wal(origin, cfg, "blocks") if origin else None
+                wal = self._resolve_wal(origin, cfg, "transcript") if origin else None
+                title = title or self._derive_meeting_title(blocks, wal, entries)
+                match = re.search(r"(\d{4}-\d{2}-\d{2})", title)
+                date_str = date_str or (match.group(1) if match else snapshot_date)
+                self._write_transcript(entries, title, date_str, cfg, meeting_id, background=background)
                 delete_persisted_accumulator(meeting_id)
                 self._last_failed_meeting = None
-                self._last_run_note_failed = False
-
-                emit({
-                    "event": "done",
-                    "title": slug,
-                    "path": str(note_path),
-                    "transcript_path": (failed or {}).get("transcript_path", ""),
-                    "attendees": attendees,
-                    "meeting_id": meeting_id,
-                })
+                self._last_run_save_failed = False
             except Exception as exc:
-                emit({"event": "error", "message": _friendly_error(exc)})
+                self._record_save_failure(meeting_id, title or "Recovered meeting", date_str, exc, background=background)
             finally:
-                self._generating_lock.release()
-                self._set_state(EngineState.IDLE)
+                self._saving_lock.release()
+                if not background:
+                    self._set_state(EngineState.IDLE)
 
         threading.Thread(target=worker, daemon=True).start()
 

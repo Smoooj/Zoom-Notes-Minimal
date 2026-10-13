@@ -69,3 +69,14 @@ def back_to_back_marc_anna_blocks() -> Path:
     if not path.exists():
         pytest.skip("back_to_back_marc_anna blocks WAL not captured")
     return path
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_files(tmp_path, monkeypatch):
+    """Keep regression tests away from real meeting caches and user settings."""
+    import zoom_config
+    import zoom_notes
+    monkeypatch.setattr(zoom_config, "_CONFIG_DIR", tmp_path / "settings")
+    monkeypatch.setattr(zoom_config, "_CONFIG_FILE", tmp_path / "settings" / "settings.json")
+    monkeypatch.setattr(zoom_config, "_cached_config", None)
+    monkeypatch.setattr(zoom_notes, "_CACHE_DIR", tmp_path / "cache")
